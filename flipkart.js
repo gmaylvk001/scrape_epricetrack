@@ -5,7 +5,7 @@ const { executeMongoFind, executeMongoCount, executeMongoUpdate } = require('./m
 const cronName = 'flipkart';
 
 async function flipkartScraper(req, res) {
-    const delay = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+const delay = (ms) => new Promise(resolve => setTimeout(resolve, ms));
     
     let browser;
 
@@ -37,6 +37,10 @@ async function flipkartScraper(req, res) {
             password: 'qsfp3x1obv71'
         });
         */
+
+        // await page.setUserAgent(
+        //     'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36'
+        // );
 
         /*
         await page.goto(productUrl, {
@@ -259,7 +263,7 @@ async function flipkartScraper(req, res) {
                         
                         }catch (error) {
 
-                            console.error(`${product[`${companyId}_product_id`]}`);
+                            console.error(`${product[`${companyId}_product_id `]}`);
                             console.error(`Error scraping product ${product[`${companyId}_product_id `]}`);
                             console.error(error);
                         }
@@ -308,20 +312,20 @@ async function flipkartScraper(req, res) {
             });
         }
 
-    }
-    catch(error){
+    } catch (error) {
 
         res.status(500).json({
             status: false,
             message: error.message
         });
 
-    } 
-    finally {
+    } finally {
+
         if (browser) {
             console.log('Closing browser...');
             await browser.close();
         }
+
     }
 
 };
