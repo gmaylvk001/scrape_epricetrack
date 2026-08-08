@@ -13,11 +13,20 @@ const delay = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 
         browser = await puppeteer.launch({
             headless: true,
+            executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || undefined,
             args: [
                 '--no-sandbox',
                 '--disable-setuid-sandbox',
-                /* '--proxy-server=http://31.59.20.176:6754' */
-            ]
+                '--disable-dev-shm-usage',
+                '--disable-gpu',
+                '--disable-software-rasterizer',
+                '--disable-extensions',
+                '--disable-background-networking',
+                '--disable-background-timer-throttling',
+                '--disable-renderer-backgrounding',
+                '--disable-features=Translate,BackForwardCache'
+            ],
+            timeout: 30000
         });
 
         const page = await browser.newPage();
@@ -29,9 +38,9 @@ const delay = (ms) => new Promise(resolve => setTimeout(resolve, ms));
         });
         */
 
-        await page.setUserAgent(
-            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36'
-        );
+        // await page.setUserAgent(
+        //     'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36'
+        // );
 
         /*
         await page.goto(productUrl, {
@@ -180,6 +189,8 @@ const delay = (ms) => new Promise(resolve => setTimeout(resolve, ms));
                                         rating: data.aggregateRating?.ratingValue || 0 
                                     };
                                 });
+
+                                // console.log(result);
 
                                 varProductPrice = 'No Result';
                                 varProductStock = 'No Result';
