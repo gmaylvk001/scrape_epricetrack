@@ -6,6 +6,8 @@ const cronName = 'vijaysales';
 
 async function vijaysalesScraper(req, res) {
 const delay = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+
+    const usergent = req.headers['user-agent'];
     
     let browser;
 
@@ -297,6 +299,7 @@ const delay = (ms) => new Promise(resolve => setTimeout(resolve, ms));
                 }
 
                 return res.status(200).json({
+                    ua : usergent,
                     status: true,
                     message: "Scraping completed",
                     totalProcessed: productCount
