@@ -160,15 +160,8 @@ const delay = (ms) => new Promise(resolve => setTimeout(resolve, ms));
                                         return el ? el.getAttribute(attr) : '';
                                     };
 
-                                    const availablestatus = (getText('#availability .a-color-success') || getText('#availability span') || getText('#availability')).toLowerCase().trim();
-
-                                    if((!availablestatus.includes('in stock')) && (!availablestatus.includes('currently unavailable'))){
-                                        return null;
-                                    }
-
                                     return {
-                                        price: getText('.a-price .a-offscreen'),
-                                        availability: availablestatus,
+                                        price: getText('#apex-pricetopay-accessibility-label'),
                                         image: getAttr('#landingImage', 'src'),
                                         review: getText('#acrCustomerReviewText') || 0,
                                         rating: getText('.mvt-cm-cr-review-stars-mini-popover span') || 0
@@ -182,10 +175,8 @@ const delay = (ms) => new Promise(resolve => setTimeout(resolve, ms));
                                 varProductRating = 'No Result';
                                 scrapeStatus = 'pending';
 
-
                                 if(result !== null){
 
-                                    const status = (result.availability || '').toLowerCase().trim();
                                     varProductImage = result.image || 'No Result';
                                     varProductReview = result.review
                                     ? parseFloat(result.review.replace(/[^0-9.]/g, '')) || 0
@@ -194,21 +185,21 @@ const delay = (ms) => new Promise(resolve => setTimeout(resolve, ms));
                                     ? parseFloat(result.rating.replace(/[^0-9.]/g, '')) || 0
                                     : 'No Result';
 
-                                    if (status === 'in stock') {
+                                    if (result.price) {
 
                                         const priceValue = result.price.match(/[\d,]+(?:\.\d+)?/)?.[0] || '';
                                         const newPrice = parseFloat(priceValue.replace(/,/g, ''));
                                         if(newPrice > 0){
                                             varProductPrice = newPrice;
                                             varProductStock = 'In stock';
+                                        }else{
+                                            varProductStock = 'Out Of Stock';
                                         }
                                         
-                                        
-                                    }else if(status.includes('outofstock') || status.includes('currently unavailable')){
+                                    }else {
                                         varProductStock = 'Out Of Stock';
                                     }
                                     scrapeStatus = 'completed';
-
                                 }
                             }
 
