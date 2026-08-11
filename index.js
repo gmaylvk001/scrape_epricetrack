@@ -1,4 +1,5 @@
 const express = require('express');
+const cors = require("cors");
 const puppeteer = require('puppeteer');
 require('dotenv').config({ quiet: true });
 
@@ -26,6 +27,19 @@ const { pittappillilScraper } = require('./pittappillil');
 const { executeMongoFind } = require('./mongo');
 
 const app = express();
+
+app.use(cors({
+    origin: [
+        "https://epricetrack.com",
+        "https://www.epricetrack.com",
+        "http://localhost:8080"
+    ],
+    methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+    allowedHeaders: ["Content-Type", "Authorization"]
+}));
+
+app.options("*", cors());
+app.use(express.json());
 
 app.get('/scrape', scrapeProduct);
 app.get('/amazon', amazonScraper);
