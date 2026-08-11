@@ -112,6 +112,8 @@ const delay = (ms) => new Promise(resolve => setTimeout(resolve, ms));
                     await updateStartTimeInDb(cmpid, companyId, cronName, ScrapingProductCount);
                 }
 
+                const scrapedData = [];
+
                 for (const product of ArrGetProductInfo) {
 
                     const productUrl = product.product_url;
@@ -251,7 +253,16 @@ const delay = (ms) => new Promise(resolve => setTimeout(resolve, ms));
                                 }
                             );
 
+                            scrapedData.push({
+                                product_ean_id: product[`${companyId}_product_id`],
+                                product_code: product[`${companyId}_product_code`],
+                                product_price: varProductPrice,
+                                product_stock: varProductStock,
+                                modified_date: modifiedDate
+                            });
+
                             productCount++;
+
                             if (!isSingleProduct) {
                                 await updateEndTimeInDb(productCount, 'running', cmpid, companyId, null, cronName, cronStartTime, ScrapingProductCount);
                             }
@@ -287,7 +298,8 @@ const delay = (ms) => new Promise(resolve => setTimeout(resolve, ms));
                 return res.status(200).json({
                     status: true,
                     message: "Scraping completed",
-                    totalProcessed: productCount
+                    totalProcessed: productCount,
+                    data : scrapedData
                 });
 
             }else{

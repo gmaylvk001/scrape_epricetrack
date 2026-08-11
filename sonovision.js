@@ -125,6 +125,8 @@ const delay = (ms) => new Promise(resolve => setTimeout(resolve, ms));
                 }
                 
                 let productCount = 0;
+
+                const scrapedData = [];
                 
                 for (const product of ArrGetProductInfo) {
                     // console.log(product.product_url); return false;
@@ -229,6 +231,14 @@ const delay = (ms) => new Promise(resolve => setTimeout(resolve, ms));
                                 }
                             );
 
+                            scrapedData.push({
+                                product_ean_id: product[`${companyId}_product_id`],
+                                product_code: product[`${companyId}_product_code`],
+                                product_price: varProductPrice,
+                                product_stock: varProductStock,
+                                modified_date: modifiedDate
+                            });
+
                             productCount++;
                             
                             if (!isSingleProduct) {
@@ -268,7 +278,8 @@ const delay = (ms) => new Promise(resolve => setTimeout(resolve, ms));
                 return res.status(200).json({
                     status: true,
                     message: "Scraping completed",
-                    totalProcessed: productCount
+                    totalProcessed: productCount,
+                    data : scrapedData
                 });
             }
             else{
