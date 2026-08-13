@@ -60,6 +60,9 @@ app.get('/croma', cromaScraper);
 app.get('/supreme_mobiles', supremeMobilesScraper);
 app.get('/pittappillil', pittappillilScraper);
 
-app.listen(3005, () => {
-    console.log('Server started on port 3005');
+const PORT = process.env.PORT;
+
+app.listen(PORT, () => {
+  console.log(`Server running on port ${PORT}`);
 });
+
