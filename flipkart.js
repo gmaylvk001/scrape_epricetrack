@@ -17,6 +17,8 @@ const cronName = 'flipkart';
 
 async function flipkartScraper(req, res) {
 
+    const proxyServer = `http://${process.env.PROXY_SERVER}`;
+
     const delay = (ms) =>
         new Promise(resolve => setTimeout(resolve, ms));
 
@@ -153,7 +155,8 @@ async function flipkartScraper(req, res) {
                 '--disable-background-networking',
                 '--disable-background-timer-throttling',
                 '--disable-renderer-backgrounding',
-                '--disable-features=Translate,BackForwardCache'
+                '--disable-features=Translate,BackForwardCache',
+                `--proxy-server=${proxyServer}`
             ],
 
             timeout: 30000
