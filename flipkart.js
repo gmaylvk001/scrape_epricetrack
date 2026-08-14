@@ -626,15 +626,42 @@ async function flipkartScraper(req, res) {
                 =================================================
                 */
 
-                await page.goto(productUrl, {
+                let pageLoaded = false;
+                let lastError = null;
 
-                    waitUntil:
-                        'domcontentloaded',
+                for (let attempt = 1; attempt <= 3; attempt++) {
+                    try {
+                        console.log(
+                            `Loading product ${productId} - Attempt ${attempt}/3`
+                        );
 
-                    // Reduced from 50 seconds
-                    timeout:
-                        30000
-                });
+                        await page.goto(productUrl, {
+                            waitUntil: 'domcontentloaded',
+                            timeout: 60000
+                        });
+
+                        pageLoaded = true;
+                        break;
+
+                    } catch (error) {
+
+                        lastError = error;
+
+                        console.error(
+                            `Page load failed - Attempt ${attempt}/3`,
+                            productId,
+                            error.message
+                        );
+
+                        if (attempt < 3) {
+                            await delay(3000);
+                        }
+                    }
+                }
+
+                if (!pageLoaded) {
+                    throw lastError;
+                }
 
 
                 sendEvent('product_step', {
