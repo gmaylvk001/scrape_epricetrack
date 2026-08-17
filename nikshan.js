@@ -1,342 +1,1429 @@
 const puppeteer = require('puppeteer');
-const { getCurrentIndTimeInfo, updateStartTimeInDb, updateEndTimeInDb } = require('./utils/cronTime');
-const { executeMongoFind, executeMongoCount, executeMongoUpdate } = require('./mongo');
+const {
+    getCurrentIndTimeInfo,
+    updateStartTimeInDb,
+    updateEndTimeInDb
+} = require('./utils/cronTime');
+
 const { updatePriceChangeData } = require('./utils/priceChange');
+
+const {
+    executeMongoFind,
+    executeMongoCount,
+    executeMongoUpdate
+} = require('./mongo');
+
 const cronName = 'nikshan';
 
 async function nikshanScraper(req, res) {
-const delay = (ms) => new Promise(resolve => setTimeout(resolve, ms));
-    
+
+    const delay = (ms) =>
+        new Promise(resolve => setTimeout(resolve, ms));
+
     let browser;
+
+    /*
+    ============================================================
+    SSE RESPONSE HELPERS
+    ============================================================
+    */
+
+    const sendEvent = (event, data) => {
+
+        if (res.writableEnded) {
+            return;
+        }
+
+        res.write(`event: ${event}\n`);
+        res.write(`data: ${JSON.stringify(data)}\n\n`);
+
+        // Make sure data is flushed
+        if (typeof res.flush === 'function') {
+            res.flush();
+        }
+    };
+
+
+    /*
+    ============================================================
+    REQUEST VALIDATION
+    ============================================================
+    */
+
+    const cmpid = req.query.cmpid;
+
+    if (!cmpid) {
+        return res.status(400).json({
+            status: false,
+            message: 'cmpid is required'
+        });
+    }
+
+    const companyId = cmpid.replace('plm_user_info_', '');
+
+    const ean = req.query.ean;
+    const itemcode = req.query.itemcode;
+
+    const isSingleProduct = !!(ean && itemcode);
+
+
+    /*
+    ============================================================
+    SSE HEADERS
+    ============================================================
+    */
+
+    res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
+    res.setHeader('Cache-Control', 'no-cache, no-transform');
+    res.setHeader('Connection', 'keep-alive');
+
+    // Important for nginx / reverse proxy buffering
+    res.setHeader('X-Accel-Buffering', 'no');
+
+    // CORS
+    res.setHeader('Access-Control-Allow-Origin', '*');
+
+    if (typeof res.flushHeaders === 'function') {
+        res.flushHeaders();
+    }
+
+
+    /*
+    ============================================================
+    CLIENT DISCONNECT HANDLING
+    ============================================================
+    */
+
+    let clientDisconnected = false;
+
+    req.on('close', () => {
+
+        clientDisconnected = true;
+
+        console.log(
+            'Nikshan client disconnected'
+        );
+    });
+
+
+    /*
+    ============================================================
+    INITIAL RESPONSE
+    ============================================================
+    */
+
+    sendEvent('start', {
+        status: true,
+        message: 'Nikshan scraping started',
+        cmpid,
+        companyId,
+        isSingleProduct
+    });
+
 
     try {
 
+        /*
+        ========================================================
+        LAUNCH BROWSER
+        ========================================================
+        */
+
+        sendEvent('step', {
+            step: 'browser',
+            status: 'running',
+            message: 'Launching browser...'
+        });
+
+
         browser = await puppeteer.launch({
+
             headless: true,
+
+            executablePath:
+                process.env.PUPPETEER_EXECUTABLE_PATH || undefined,
+
             args: [
                 '--no-sandbox',
                 '--disable-setuid-sandbox',
-                /* '--proxy-server=http://31.59.20.176:6754' */
-            ]
+                '--disable-dev-shm-usage',
+                '--disable-gpu',
+                '--disable-software-rasterizer',
+                '--disable-extensions',
+                '--disable-background-networking',
+                '--disable-background-timer-throttling',
+                '--disable-renderer-backgrounding',
+                '--disable-features=Translate,BackForwardCache'
+            ],
+
+            timeout: 30000
         });
+
 
         const page = await browser.newPage();
 
+
         /*
-            await page.authenticate({
-                username: 'eqenhyym',
-                password: 'qsfp3x1obv71'
-            });
+        ========================================================
+        USER AGENT
+        ========================================================
         */
 
         await page.setUserAgent(
             'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36'
         );
 
+
         /*
-            await page.goto(productUrl, {
-                waitUntil: 'networkidle2',
-                timeout: 30000
-            });
+        ========================================================
+        GET PRODUCTS
+        ========================================================
         */
-        
-        const cmpid = req.query.cmpid;
-        if (!cmpid) {
-            return res.status(400).json({
-                status: false,
-                message: 'cmpid is required'
-            });
-        }
-        const companyId = cmpid.replace('plm_user_info_', '');
-        const ean = req.query.ean;
-        const itemcode = req.query.itemcode;
+
+        sendEvent('step', {
+            step: 'products',
+            status: 'running',
+            message: 'Fetching Nikshan products...'
+        });
+
 
         const filter = {
+
             status: 'active',
-            product_scrape_status: { $in: ['pending', 'completed'] },
-            product_url: { $nin: ['', null, 'No Result'] }
+
+            product_scrape_status: {
+                $in: ['pending', 'completed']
+            },
+
+            product_url: {
+                $nin: ['', null, 'No Result']
+            }
         };
 
-        const isSingleProduct = !!(ean && itemcode);
 
-        if(isSingleProduct){
+        /*
+        ========================================================
+        SINGLE PRODUCT FILTER
+        ========================================================
+        */
+
+        if (isSingleProduct) {
+
             filter[`${companyId}_product_id`] = ean;
+
             filter[`${companyId}_product_code`] = itemcode;
         }
 
+
+        /*
+        ========================================================
+        GET NIKSHAN PRODUCTS
+        ========================================================
+        */
+
         const products = await executeMongoFind(
+
             {
-              collection: 'ept_product_details_new_nikshan',
-              cmpid
+                collection:
+                    'ept_product_details_new_nikshan',
+
+                cmpid
             },
+
             filter,
-            { _id: 0 }
+
+            {
+                _id: 0
+            }
         );
 
-        if(products.length > 0){
-             
-            const existingProducts = await executeMongoFind(
-                {
-                    collection: 'ept_product_details_new',
-                    cmpid
-                },
-                {
-                    $and: [
-                        { status: 'active' },
-                        {ean_product_data_details_scrap_status : 'completed'}
-                    ]
-                },
-                { _id: 0, product_ean_id: 1, product_code: 1 }
+
+        if (!products || products.length === 0) {
+
+            sendEvent('complete', {
+
+                status: true,
+
+                message:
+                    'Competitor products not found',
+
+                totalProcessed: 0,
+
+                data: []
+            });
+
+            res.end();
+
+            return;
+        }
+
+
+        /*
+        ========================================================
+        GET EXISTING PRODUCTS
+        ========================================================
+        */
+
+        const existingProducts = await executeMongoFind(
+
+            {
+                collection:
+                    'ept_product_details_new',
+
+                cmpid
+            },
+
+            {
+                $and: [
+                    {
+                        status: 'active'
+                    },
+                    {
+                        ean_product_data_details_scrap_status: 'completed'
+                    }
+                ]
+            },
+
+            {
+                _id: 0,
+
+                product_ean_id: 1,
+
+                product_code: 1
+            }
+        );
+
+
+        /*
+        ========================================================
+        CREATE PRODUCT MAP
+        ========================================================
+        */
+
+        const productMap = new Set();
+
+
+        existingProducts.forEach((row) => {
+
+            const key =
+                `${row.product_ean_id}_${row.product_code}`;
+
+            productMap.add(key);
+        });
+
+
+        /*
+        ========================================================
+        FILTER MATCHING PRODUCTS
+        ========================================================
+        */
+
+        const ArrGetProductInfo = [];
+
+
+        products.forEach((arrTmp) => {
+
+            const key =
+                `${arrTmp[`${companyId}_product_id`]}_${arrTmp[`${companyId}_product_code`]}`;
+
+
+            if (
+                productMap.has(key) &&
+                arrTmp['product_url'].includes('https://nikshanonline.com')
+            ) {
+
+                ArrGetProductInfo.push(arrTmp);
+            }
+        });
+
+
+        if (ArrGetProductInfo.length === 0) {
+
+            sendEvent('complete', {
+
+                status: true,
+
+                message:
+                    'Active products not found',
+
+                totalProcessed: 0,
+
+                data: []
+            });
+
+            res.end();
+
+            return;
+        }
+
+
+        /*
+        ========================================================
+        SCRAPING INITIALIZATION
+        ========================================================
+        */
+
+        let productCount = 0;
+
+        const ScrapingProductCount =
+            ArrGetProductInfo.length;
+
+
+        const startTime =
+            new Date(
+                `${getCurrentIndTimeInfo(
+                    'India_Railway_Date_Only'
+                )}T${getCurrentIndTimeInfo(
+                    'India_Railway_Time'
+                )}`
             );
 
-            const productMap = new Set();
 
-            existingProducts.forEach((row) => {
-                const key = `${row.product_ean_id}_${row.product_code}`;
-                productMap.add(key);
-            });
+        const cronStartTime =
+            getCurrentIndTimeInfo();
 
-            // Filter matching products
-            const ArrGetProductInfo = [];
-            products.forEach((arrTmp) => {
-                const key = `${arrTmp[`${companyId}_product_id`]}_${arrTmp[`${companyId}_product_code`]}`;
 
-                if (productMap.has(key) && arrTmp['product_url'].includes('https://nikshanonline.com')) {
-                    ArrGetProductInfo.push(arrTmp);
-                }
-            });
+        /*
+        ========================================================
+        UPDATE START TIME
+        ========================================================
+        */
 
-            if(ArrGetProductInfo.length > 0){
+        if (!isSingleProduct) {
 
-                let productCount = 0;
-                const startTime = new Date(`${getCurrentIndTimeInfo('India_Railway_Date_Only')}T${getCurrentIndTimeInfo('India_Railway_Time')}`);
-                const cronStartTime = getCurrentIndTimeInfo();
-                const ScrapingProductCount = ArrGetProductInfo.length;
-                if (!isSingleProduct) {
-                    await updateStartTimeInDb(cmpid, companyId, cronName, ScrapingProductCount);
-                }
-            
-                for (const product of ArrGetProductInfo) {
-                
-                    const productUrl = product.product_url;
-                    const hostname = new URL(productUrl).hostname;
+            await updateStartTimeInDb(
 
-                    let result = {};
+                cmpid,
 
-                    if (hostname.includes('nikshan')) {
-                        try {
+                companyId,
 
-                            await page.goto(productUrl, {
-                                waitUntil: 'networkidle2',
-                                timeout: 50000
-                            });
+                cronName,
 
-                            let varProductPrice;
-                            let varProductStock;
-                            let varProductImage;
-                            let varProductReview;
-                            let varProductRating;
-                            let scrapeStatus;
-                            let modifiedDate;
+                ScrapingProductCount
+            );
+        }
 
-                            if(await page.$('.single-product-page') === null) {
-                                
-                                varProductPrice = 'No Result';
-                                varProductStock = 'No Result';
-                                varProductImage = 'No Result';
-                                varProductReview = 'No Result';
-                                varProductRating = 'No Result';
-                                scrapeStatus = 'pending';
-                            }
-                            else{
-                                const result = await page.evaluate(() => {
 
-                                    const getText = (selector) => {
-                                        const el = document.querySelector(selector);
-                                        return el ? el.textContent.trim() : '';
-                                    };
+        /*
+        ========================================================
+        SEND PRODUCT COUNT
+        ========================================================
+        */
 
-                                    const review = getText('.wd-rating-summary-total') || 0;
-                                    const rating = getText('.wd-rating-summary-main') || 0;
+        sendEvent('progress', {
 
-                                    const jsonLd = document.querySelector('.rank-math-schema-pro');
+            status: 'running',
 
-                                    if (!jsonLd) {
-                                        return null;
-                                    }
+            totalProducts:
+                ScrapingProductCount,
 
-                                    const parsedData = JSON.parse(jsonLd.textContent);
+            processedProducts: 0,
 
-                                    const product = parsedData['@graph'].find(item =>
-                                        item['@type'] === 'Product' ||
-                                        item['@type'] === 'ProductGroup'
-                                    );
+            progress: 0,
 
-                                    if(!product){
-                                        return null;
-                                    }
+            message:
+                `${ScrapingProductCount} products found`
+        });
 
-                                    if(product['@type'] === 'Product'){
-                                        return {
-                                            name: product.name || '',
-                                            brand: product.brand?.name || '',
-                                            price: product.offers?.price || '',
-                                            availability: product.offers?.availability || '',
-                                            image: product.image?.[0]?.url || '',
-                                            review: review,
-                                            rating: rating
-                                        };
-                                    }else if(product['@type'] === 'ProductGroup'){
-                                        return {
-                                            name: product.name || '',
-                                            brand: product.brand?.name || '',
-                                            price: product.hasVariant?.[0]?.offers?.price || '',
-                                            availability: product.hasVariant?.[0]?.offers?.availability || '',
-                                            image: product.image?.[0]?.url || 0,
-                                            review: review,
-                                            rating: rating
-                                        };
-                                    }
 
-                                });
+        const scrapedData = [];
 
-                                varProductPrice = 'No Result';
-                                varProductStock = 'No Result';
-                                varProductImage = 'No Result';
-                                varProductReview = 'No Result';
-                                varProductRating = 'No Result';
-                                scrapeStatus = 'pending';
 
-                                if (result !== null) {
+        /*
+        ========================================================
+        PRODUCT LOOP
+        ========================================================
+        */
 
-                                    const status = (result.availability || '').toLowerCase().trim();
-                                    varProductImage = result.image || 'No Result';
-                                    varProductReview = result.review !== null && result.review !== undefined && result.review !== ''
-                                    ? parseFloat(String(result.review).replace(/[^0-9.]/g, '')) || 0
-                                    : 'No Result';
-                                    varProductRating = result.rating != null
-                                    ? parseFloat(result.rating) || 0
-                                    : 'No Result';
+        for (
+            const product of ArrGetProductInfo
+        ) {
 
-                                    if (status.includes('instock')) {
 
-                                        const cleanedPrice = (result.price || '')
-                                            .replace(/[^0-9.]/g, '');
+            /*
+            ====================================================
+            CHECK CLIENT CONNECTION
+            ====================================================
+            */
 
-                                        varProductPrice = parseFloat(cleanedPrice) || 0;
-                                        varProductStock = 'In stock';
+            if (clientDisconnected) {
 
-                                    } else if (
-                                        status.includes('outofstock') ||
-                                        status.includes('currently unavailable')
-                                    ) {
-                                        varProductStock = 'Out Of Stock';
-                                    }
-                                    scrapeStatus = 'completed';
-                                }
-                                    
-                            }
+                console.log(
+                    'Client disconnected. Stopping stream.'
+                );
 
-                            modifiedDate = getCurrentIndTimeInfo('India_Railway_Date_Time');
-
-                            updatePriceChangeData(scrapeStatus,product.product_price,varProductPrice,product[`${companyId}_product_id`],product[`${companyId}_product_code`],cronName,cmpid,companyId,);
-
-                            await executeMongoUpdate(
-                                {
-                                    collection: 'ept_product_details_new_nikshan',
-                                    cmpid
-                                },
-                                {
-                                    [`${companyId}_product_id`]:
-                                        product[`${companyId}_product_id`],
-
-                                    [`${companyId}_product_code`]:
-                                        product[`${companyId}_product_code`]
-                                },
-                                {
-                                    $set: {
-                                        product_price: varProductPrice,
-                                        product_stock: varProductStock,
-                                        product_image: varProductImage,
-                                        product_review: varProductReview,
-                                        product_rating: varProductRating,
-                                        modified_date: modifiedDate,
-                                        product_scrape_status: scrapeStatus
-                                    }
-                                }
-                            );
-
-                            productCount++;
-                            if (!isSingleProduct) {
-                                await updateEndTimeInDb(productCount, 'running', cmpid, companyId, null, cronName, cronStartTime, ScrapingProductCount);
-                            }
-                            
-                        }
-
-                        catch (error) {
-                            console.error(`Error scraping product ${product[`${companyId}_product_id`]}`);
-                            console.error(error);
-                        }
-                    }
-
-                    else {
-
-                        console.log(`${companyId}_product_id`);
-                        console.log(productUrl);
-                        return res.status(400).json({
-                            status: false,
-                            message: 'Only Nikshan URLs supported'
-                        });
-
-                    }
-                
-                };
-
-                const endTime = new Date(`${getCurrentIndTimeInfo('India_Railway_Date_Only')}T${getCurrentIndTimeInfo('India_Railway_Time')}`);
-
-                const diffMs = endTime - startTime;
-                const totalMins = +(diffMs / 60000).toFixed(2);
-
-                if (!isSingleProduct) {
-                    await updateEndTimeInDb(productCount, 'ending', cmpid, companyId, totalMins, cronName, cronStartTime, ScrapingProductCount);
-                }
-
-                return res.status(200).json({
-                    status: true,
-                    message: "Scraping completed",
-                    totalProcessed: productCount
-                });
-
-            }else{
-                return res.status(200).json({
-                    status: true,
-                    message: "Active products not found"
-                });
+                break;
             }
 
-        }else{
 
-            return res.status(200).json({
-                status: true,
-                message: "Competitor Products not found"
+            const productUrl =
+                product.product_url;
+
+
+            const productId =
+                product[
+                    `${companyId}_product_id`
+                ];
+
+
+            const productCode =
+                product[
+                    `${companyId}_product_code`
+                ];
+
+
+            /*
+            ====================================================
+            URL VALIDATION
+            ====================================================
+            */
+
+            let hostname;
+
+            try {
+
+                hostname =
+                    new URL(productUrl).hostname;
+
+            } catch (error) {
+
+                console.error(
+                    'Invalid product URL:',
+                    productUrl
+                );
+
+                sendEvent('product_error', {
+
+                    productId,
+
+                    productCode,
+
+                    status: 'error',
+
+                    message:
+                        'Invalid product URL'
+                });
+
+                continue;
+            }
+
+
+            /*
+            ====================================================
+            NIKSHAN URL CHECK
+            ====================================================
+            */
+
+            if (!hostname.includes('nikshan')) {
+
+                sendEvent('product_error', {
+
+                    productId,
+
+                    productCode,
+
+                    status: 'error',
+
+                    message:
+                        'Only Nikshan URLs supported'
+                });
+
+                continue;
+            }
+
+
+            /*
+            ====================================================
+            PRODUCT START
+            ====================================================
+            */
+
+            productCount++;
+
+            const currentProductNumber =
+                productCount;
+
+
+            const currentProgress =
+                Math.round(
+                    (
+                        (
+                            currentProductNumber - 1
+                        ) /
+                        ScrapingProductCount
+                    ) * 100
+                );
+
+
+            sendEvent('product_start', {
+
+                productNumber:
+                    currentProductNumber,
+
+                totalProducts:
+                    ScrapingProductCount,
+
+                progress:
+                    currentProgress,
+
+                productId,
+
+                productCode,
+
+                productUrl,
+
+                status: 'running',
+
+                message:
+                    `Scraping product ${currentProductNumber} of ${ScrapingProductCount}`
             });
+
+
+            let varProductPrice =
+                'No Result';
+
+            let varProductStock =
+                'No Result';
+
+            let varProductImage =
+                'No Result';
+
+            let varProductReview =
+                'No Result';
+
+            let varProductRating =
+                'No Result';
+
+            let scrapeStatus =
+                'pending';
+
+            let modifiedDate;
+
+
+            /*
+            ====================================================
+            PRODUCT SCRAPING
+            ====================================================
+            */
+
+            try {
+
+                sendEvent('product_step', {
+
+                    productNumber:
+                        currentProductNumber,
+
+                    productId,
+
+                    productCode,
+
+                    step: 'page_loading',
+
+                    status: 'running',
+
+                    message:
+                        'Opening Nikshan product page...'
+                });
+
+
+                /*
+                =================================================
+                PAGE GOTO
+                =================================================
+                */
+
+                await page.goto(productUrl, {
+
+                    waitUntil:
+                        'networkidle2',
+
+                    timeout:
+                        50000
+                });
+
+
+                sendEvent('product_step', {
+
+                    productNumber:
+                        currentProductNumber,
+
+                    productId,
+
+                    productCode,
+
+                    step:
+                        'page_loaded',
+
+                    status:
+                        'completed',
+
+                    message:
+                        'Nikshan page loaded'
+                });
+
+
+                /*
+                =================================================
+                PRODUCT PAGE CHECK
+                =================================================
+                */
+
+                const productPageExists =
+                    await page.$('.single-product-page');
+
+
+                if (!productPageExists) {
+
+                    varProductPrice =
+                        'No Result';
+
+                    varProductStock =
+                        'No Result';
+
+                    varProductImage =
+                        'No Result';
+
+                    varProductReview =
+                        'No Result';
+
+                    varProductRating =
+                        'No Result';
+
+                    scrapeStatus =
+                        'pending';
+
+
+                    sendEvent('product_step', {
+
+                        productNumber:
+                            currentProductNumber,
+
+                        productId,
+
+                        productCode,
+
+                        step:
+                            'product_page',
+
+                        status:
+                            'failed',
+
+                        message:
+                            'Product page not found'
+                    });
+
+                } else {
+
+
+                    /*
+                    =============================================
+                    EXTRACT JSON-LD
+                    =============================================
+                    */
+
+                    sendEvent('product_step', {
+
+                        productNumber:
+                            currentProductNumber,
+
+                        productId,
+
+                        productCode,
+
+                        step:
+                            'extracting',
+
+                        status:
+                            'running',
+
+                        message:
+                            'Extracting product information...'
+                    });
+
+
+                    const result =
+                        await page.evaluate(() => {
+
+                            const getText = (selector) => {
+                                const el = document.querySelector(selector);
+                                return el ? el.textContent.trim() : '';
+                            };
+
+                            const review = getText('.wd-rating-summary-total') || 0;
+                            const rating = getText('.wd-rating-summary-main') || 0;
+
+                            const jsonLd = document.querySelector('.rank-math-schema-pro');
+
+                            if (!jsonLd) {
+                                return null;
+                            }
+
+                            try {
+
+                                const parsedData = JSON.parse(jsonLd.textContent);
+
+                                const product = parsedData['@graph'].find(item =>
+                                    item['@type'] === 'Product' ||
+                                    item['@type'] === 'ProductGroup'
+                                );
+
+                                if (!product) {
+                                    return null;
+                                }
+
+                                if (product['@type'] === 'Product') {
+
+                                    return {
+                                        name: product.name || '',
+                                        brand: product.brand?.name || '',
+                                        price: product.offers?.price || '',
+                                        availability: product.offers?.availability || '',
+                                        image: product.image?.[0]?.url || '',
+                                        review: review,
+                                        rating: rating
+                                    };
+
+                                } else if (product['@type'] === 'ProductGroup') {
+
+                                    return {
+                                        name: product.name || '',
+                                        brand: product.brand?.name || '',
+                                        price: product.hasVariant?.[0]?.offers?.price || '',
+                                        availability: product.hasVariant?.[0]?.offers?.availability || '',
+                                        image: product.image?.[0]?.url || '',
+                                        review: review,
+                                        rating: rating
+                                    };
+                                }
+
+                                return null;
+
+                            } catch (error) {
+
+                                return null;
+                            }
+
+                        });
+
+
+                    /*
+                    =============================================
+                    DEFAULT VALUES
+                    =============================================
+                    */
+
+                    varProductPrice =
+                        'No Result';
+
+                    varProductStock =
+                        'No Result';
+
+                    varProductImage =
+                        'No Result';
+
+                    varProductReview =
+                        'No Result';
+
+                    varProductRating =
+                        'No Result';
+
+                    scrapeStatus =
+                        'pending';
+
+
+                    /*
+                    =============================================
+                    RESULT FOUND
+                    =============================================
+                    */
+
+                    if (result !== null) {
+
+                        const status =
+                            (result.availability || '')
+                                .toLowerCase()
+                                .trim();
+
+
+                        varProductImage =
+                            result.image ||
+                            'No Result';
+
+
+                        varProductReview =
+                            result.review !== null &&
+                            result.review !== undefined &&
+                            result.review !== ''
+                                ? parseFloat(String(result.review).replace(/[^0-9.]/g, '')) || 0
+                                : 'No Result';
+
+
+                        varProductRating =
+                            result.rating != null
+                                ? parseFloat(result.rating) || 0
+                                : 'No Result';
+
+
+                        /*
+                        =========================================
+                        IN STOCK
+                        =========================================
+                        */
+
+                        if (
+                            status.includes('instock')
+                        ) {
+
+                            const cleanedPrice =
+                                (result.price || '')
+                                    .replace(
+                                        /[^0-9.]/g,
+                                        ''
+                                    );
+
+
+                            varProductPrice =
+                                parseFloat(
+                                    cleanedPrice
+                                ) || 0;
+
+
+                            varProductStock =
+                                'In stock';
+
+
+                        }
+
+                        /*
+                        =========================================
+                        OUT OF STOCK
+                        =========================================
+                        */
+
+                        else if (
+
+                            status.includes(
+                                'outofstock'
+                            ) ||
+
+                            status.includes(
+                                'currently unavailable'
+                            )
+
+                        ) {
+
+                            varProductStock =
+                                'Out Of Stock';
+                        }
+
+
+                        scrapeStatus =
+                            'completed';
+                    }
+
+
+                    sendEvent('product_step', {
+
+                        productNumber:
+                            currentProductNumber,
+
+                        productId,
+
+                        productCode,
+
+                        step:
+                            'extracting',
+
+                        status:
+                            scrapeStatus === 'completed'
+                                ? 'completed'
+                                : 'failed',
+
+                        message:
+                            scrapeStatus === 'completed'
+                                ? 'Product information extracted'
+                                : 'Product information not found'
+                    });
+                }
+
+
+                /*
+                =================================================
+                MODIFIED DATE
+                =================================================
+                */
+
+                modifiedDate =
+                    getCurrentIndTimeInfo(
+                        'India_Railway_Date_Time'
+                    );
+
+
+                /*
+                =================================================
+                PRICE CHANGE
+                =================================================
+                */
+
+                updatePriceChangeData(
+
+                    scrapeStatus,
+
+                    product.product_price,
+
+                    varProductPrice,
+
+                    productId,
+
+                    productCode,
+
+                    cronName,
+
+                    cmpid,
+
+                    companyId
+                );
+
+
+                sendEvent('product_step', {
+
+                    productNumber:
+                        currentProductNumber,
+
+                    productId,
+
+                    productCode,
+
+                    step:
+                        'database',
+
+                    status:
+                        'running',
+
+                    message:
+                        'Updating database...'
+                });
+
+
+                /*
+                =================================================
+                MONGO UPDATE
+                =================================================
+                */
+
+                await executeMongoUpdate(
+
+                    {
+                        collection:
+                            'ept_product_details_new_nikshan',
+
+                        cmpid
+                    },
+
+                    {
+                        [`${companyId}_product_id`]:
+                            productId,
+
+                        [`${companyId}_product_code`]:
+                            productCode
+                    },
+
+                    {
+                        $set: {
+
+                            product_price:
+                                varProductPrice,
+
+                            product_stock:
+                                varProductStock,
+
+                            product_image:
+                                varProductImage,
+
+                            product_review:
+                                varProductReview,
+
+                            product_rating:
+                                varProductRating,
+
+                            modified_date:
+                                modifiedDate,
+
+                            product_scrape_status:
+                                scrapeStatus
+                        }
+                    }
+                );
+
+
+                /*
+                =================================================
+                PUSH RESULT
+                =================================================
+                */
+
+                const productResult = {
+
+                    product_ean_id:
+                        productId,
+
+                    product_code:
+                        productCode,
+
+                    product_price:
+                        varProductPrice,
+
+                    product_stock:
+                        varProductStock,
+
+                    modified_date:
+                        modifiedDate,
+
+                    scrape_status:
+                        scrapeStatus
+                };
+
+
+                scrapedData.push(
+                    productResult
+                );
+
+
+                /*
+                =================================================
+                PRODUCT COMPLETE
+                =================================================
+                */
+
+                const completedProgress =
+                    Math.round(
+                        (
+                            currentProductNumber /
+                            ScrapingProductCount
+                        ) * 100
+                    );
+
+
+                sendEvent('product_complete', {
+
+                    productNumber:
+                        currentProductNumber,
+
+                    totalProducts:
+                        ScrapingProductCount,
+
+                    processedProducts:
+                        currentProductNumber,
+
+                    progress:
+                        completedProgress,
+
+                    productId,
+
+                    productCode,
+
+                    status:
+                        scrapeStatus === 'completed'
+                            ? 'success'
+                            : 'pending',
+
+                    data:
+                        productResult,
+
+                    message:
+                        `Product ${currentProductNumber} completed`
+                });
+
+
+                /*
+                =================================================
+                UPDATE CRON PROGRESS
+                =================================================
+                */
+
+                if (!isSingleProduct) {
+
+                    await updateEndTimeInDb(
+
+                        currentProductNumber,
+
+                        'running',
+
+                        cmpid,
+
+                        companyId,
+
+                        null,
+
+                        cronName,
+
+                        cronStartTime,
+
+                        ScrapingProductCount
+                    );
+                }
+
+
+            } catch (error) {
+
+
+                /*
+                =================================================
+                PRODUCT ERROR
+                =================================================
+                */
+
+                console.error(
+                    `Error scraping product ${productId}`
+                );
+
+                console.error(error);
+
+
+                sendEvent('product_error', {
+
+                    productNumber:
+                        currentProductNumber,
+
+                    totalProducts:
+                        ScrapingProductCount,
+
+                    productId,
+
+                    productCode,
+
+                    progress:
+                        Math.round(
+                            (
+                                currentProductNumber /
+                                ScrapingProductCount
+                            ) * 100
+                        ),
+
+                    status:
+                        'error',
+
+                    message:
+                        error.message
+                        || 'Error scraping product'
+                });
+
+
+                /*
+                =================================================
+                UPDATE PRODUCT AS PENDING
+                =================================================
+                */
+
+                try {
+
+                    await executeMongoUpdate(
+
+                        {
+                            collection:
+                                'ept_product_details_new_nikshan',
+
+                            cmpid
+                        },
+
+                        {
+                            [`${companyId}_product_id`]:
+                                productId,
+
+                            [`${companyId}_product_code`]:
+                                productCode
+                        },
+
+                        {
+                            $set: {
+
+                                product_scrape_status:
+                                    'pending',
+
+                                modified_date:
+                                    getCurrentIndTimeInfo(
+                                        'India_Railway_Date_Time'
+                                    )
+                            }
+                        }
+                    );
+
+                } catch (dbError) {
+
+                    console.error(
+                        'Database update error:',
+                        dbError
+                    );
+                }
+            }
+
+
+            /*
+            ====================================================
+            SMALL DELAY
+            ====================================================
+            */
+
+            await delay(100);
+
+
         }
+
+
+        /*
+        ========================================================
+        FINAL CALCULATION
+        ========================================================
+        */
+
+        const endTime =
+            new Date(
+                `${getCurrentIndTimeInfo(
+                    'India_Railway_Date_Only'
+                )}T${getCurrentIndTimeInfo(
+                    'India_Railway_Time'
+                )}`
+            );
+
+
+        const diffMs =
+            endTime - startTime;
+
+
+        const totalMins =
+            +(
+                diffMs / 60000
+            ).toFixed(2);
+
+
+        /*
+        ========================================================
+        UPDATE FINAL STATUS
+        ========================================================
+        */
+
+        if (!isSingleProduct) {
+
+            await updateEndTimeInDb(
+
+                productCount,
+
+                'ending',
+
+                cmpid,
+
+                companyId,
+
+                totalMins,
+
+                cronName,
+
+                cronStartTime,
+
+                ScrapingProductCount
+            );
+        }
+
+
+        /*
+        ========================================================
+        FINAL SSE RESPONSE
+        ========================================================
+        */
+
+        sendEvent('complete', {
+
+            status: true,
+
+            message:
+                'Scraping completed',
+
+            totalProducts:
+                ScrapingProductCount,
+
+            totalProcessed:
+                productCount,
+
+            progress: 100,
+
+            totalMinutes:
+                totalMins,
+
+            data:
+                scrapedData
+        });
+
+
+        /*
+        ========================================================
+        CLOSE STREAM
+        ========================================================
+        */
+
+        res.end();
+
 
     } catch (error) {
 
-        res.status(500).json({
-            status: false,
-            message: error.message
-        });
+
+        /*
+        ========================================================
+        MAIN ERROR
+        ========================================================
+        */
+
+        console.error(
+            'Nikshan scraper error:',
+            error
+        );
+
+
+        if (!res.writableEnded) {
+
+            sendEvent('error', {
+
+                status: false,
+
+                message:
+                    error.message
+                    || 'Nikshan scraping failed'
+            });
+
+            res.end();
+        }
+
 
     } finally {
 
+
+        /*
+        ========================================================
+        CLOSE BROWSER
+        ========================================================
+        */
+
         if (browser) {
-            console.log('Closing browser...');
-            await browser.close();
+
+            console.log(
+                'Closing browser...'
+            );
+
+            try {
+
+                await browser.close();
+
+            } catch (error) {
+
+                console.error(
+                    'Browser close error:',
+                    error
+                );
+            }
         }
     }
+}
 
+
+module.exports = {
+    nikshanScraper
 };
-
-module.exports = { nikshanScraper };
