@@ -432,12 +432,13 @@ async function cromaScraper(req, res) {
         ========================================================
         */
 
+        const pincode = req.query.pincode;
+
         sendEvent('step', {
             step: 'pincode',
             status: 'running',
-            message: 'Setting pincode for Croma...'
+            message: `Setting pincode for Croma... pincode : ${pincode}`
         });
-
 
         try {
 
@@ -469,6 +470,8 @@ async function cromaScraper(req, res) {
 
                 const input = await page.$('.pinElem');
 
+                const existingPincode = await input.evaluate(el => el.value);
+
                 // Select existing pincode
                 await input.click({ clickCount: 3 });
 
@@ -479,9 +482,16 @@ async function cromaScraper(req, res) {
                 await page.keyboard.press('Backspace');
 
                 // Enter new pincode
-                await input.type('600001', {
-                    delay: 100
-                });
+                if(pincode){
+                    await input.type(pincode, {
+                        delay: 100
+                    });
+                }
+                else{
+                    await input.type(existingPincode, {
+                        delay: 100
+                    });
+                }
 
                 // Trigger input events
                 await input.evaluate(el => {
@@ -491,6 +501,8 @@ async function cromaScraper(req, res) {
                 });
 
                 await delay(1000);
+
+                const enteredPincode = await input.evaluate(el => el.value);
 
                 // Click Continue
                 await page.click('#apply-pincode-btn');
@@ -517,7 +529,7 @@ async function cromaScraper(req, res) {
                 sendEvent('step', {
                     step: 'pincode',
                     status: 'completed',
-                    message: 'Pincode set successfully'
+                    message: `Pincode set successfully ${enteredPincode}`
                 });
             }
 
