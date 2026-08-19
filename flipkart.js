@@ -631,25 +631,38 @@ async function flipkartScraper(req, res) {
                 let pageLoaded = false;
                 let lastError = null;
 
+                const gotoWithTimeout = async (page, url, timeout = 20000) => {
+                    return Promise.race([
+                        page.goto(url, {
+                            waitUntil: 'domcontentloaded',
+                            timeout: 0
+                        }),
+
+                        new Promise((_, reject) =>
+                            setTimeout(() => {
+                                reject(
+                                    new Error(`PAGE_TIMEOUT_${timeout}MS`)
+                                );
+                            }, timeout)
+                        )
+                    ]);
+                };
+
                 for (let attempt = 1; attempt <= 3; attempt++) {
                     try {
-                        console.log(
-                            `Loading product ${productId} - Attempt ${attempt}/3`
-                        );
-                        
                         sendEvent('debug', {
                             productNumber: currentProductNumber,
                             productId,
                             productCode,
                             step: 'before_goto',
-                            url: productUrl,
-                            browserUserAgent: await page.evaluate(() => navigator.userAgent)
+                            url: productUrl
                         });
 
-                        await page.goto(productUrl, {
-                            waitUntil: 'domcontentloaded',
-                            timeout: 20000
-                        });
+                        await gotoWithTimeout(
+                            page,
+                            productUrl,
+                            20000
+                        );
 
                         sendEvent('debug', {
                             productNumber: currentProductNumber,
@@ -657,32 +670,23 @@ async function flipkartScraper(req, res) {
                             productCode,
                             step: 'after_goto',
                             currentUrl: page.url(),
-                            title: await page.title(),
-                            browserUserAgent: await page.evaluate(() => navigator.userAgent)
+                            title: await page.title()
                         });
 
                         pageLoaded = true;
-                        break;
 
                     } catch (error) {
 
-                        lastError = error;
-
                         sendEvent('debug', {
-                            attempt:`Page load failed - Attempt ${attempt}/3`,
-                            productId,
-                            error : error.message,
                             productNumber: currentProductNumber,
                             productId,
                             productCode,
-                            step: 'before_goto',
-                            url: productUrl,
-                            browserUserAgent: await page.evaluate(() => navigator.userAgent)
+                            step: 'goto_failed',
+                            error: error.message
                         });
 
-                        if (attempt < 3) {
-                            await delay(3000);
-                        }
+                        // இந்த product-ஐ skip பண்ணி next product
+                        continue;
                     }
                 }
 
