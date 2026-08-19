@@ -173,6 +173,25 @@ async function flipkartScraper(req, res) {
         ========================================================
         */
 
+        // 1. Block images/fonts/stylesheets to speed up loading
+        await page.setRequestInterception(true);
+        page.on('request', (req) => {
+            const type = req.resourceType();
+            if (['image', 'font', 'stylesheet', 'media'].includes(type)) {
+                req.abort();
+            } else {
+                req.continue();
+            }
+        });
+
+        // 2. Extra headers to mimic real browser
+        await page.setExtraHTTPHeaders({
+            'Accept-Language': 'en-IN,en-GB;q=0.9,en-US;q=0.8,en;q=0.7',
+            'Sec-Ch-UA': '"Google Chrome";v="131", "Chromium";v="131", "Not_A Brand";v="24"',
+            'Sec-Ch-UA-Mobile': '?0',
+            'Sec-Ch-UA-Platform': '"Windows"',
+        });
+
         await page.setViewport({
             width: 1366,
             height: 768,
@@ -636,25 +655,6 @@ async function flipkartScraper(req, res) {
                 =================================================
                 */
 
-                // Before navigating, set up request interception
-                await page.setRequestInterception(true);
-                page.on('request', (req) => {
-                    const type = req.resourceType();
-                    if (['image', 'font', 'stylesheet', 'media'].includes(type)) {
-                        req.abort();
-                    } else {
-                        req.continue();
-                    }
-                });
-
-                // Extra headers
-                await page.setExtraHTTPHeaders({
-                    'Accept-Language': 'en-IN,en-GB;q=0.9,en-US;q=0.8,en;q=0.7',
-                    'Sec-Ch-UA': '"Google Chrome";v="131", "Chromium";v="131", "Not_A Brand";v="24"',
-                    'Sec-Ch-UA-Mobile': '?0',
-                    'Sec-Ch-UA-Platform': '"Windows"',
-                });
-
                 let pageLoaded = false;
                 let loadError = null;
 
@@ -664,7 +664,7 @@ async function flipkartScraper(req, res) {
                     );
 
                     await page.goto(productUrl, {
-                        waitUntil: 'networkidle2',
+                        waitUntil: 'domcontentloaded',
                         timeout: 60000   // 60 seconds
                     });
 
