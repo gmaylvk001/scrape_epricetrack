@@ -12,6 +12,7 @@ const {
     executeMongoCount,
     executeMongoUpdate
 } = require('./mongo');
+const { userAgent } = require('next/server');
 
 const cronName = 'flipkart';
 
@@ -115,6 +116,7 @@ async function flipkartScraper(req, res) {
     sendEvent('start', {
         status: true,
         message: 'Flipkart scraping started',
+        userAgent: req.headers['user-agent'],
         cmpid,
         companyId,
         isSingleProduct
@@ -169,9 +171,9 @@ async function flipkartScraper(req, res) {
         ========================================================
         */
 
-        await page.setUserAgent(
-            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151.0.0.0 Safari/537.36'
-        );
+        // await page.setUserAgent(
+        //     'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151.0.0.0 Safari/537.36'
+        // );
 
 
         /*
