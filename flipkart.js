@@ -12,7 +12,6 @@ const {
     executeMongoCount,
     executeMongoUpdate
 } = require('./mongo');
-const { userAgent } = require('next/server');
 
 const cronName = 'flipkart';
 
@@ -116,7 +115,6 @@ async function flipkartScraper(req, res) {
     sendEvent('start', {
         status: true,
         message: 'Flipkart scraping started',
-        userAgent: req.headers['user-agent'],
         cmpid,
         companyId,
         isSingleProduct
@@ -164,6 +162,12 @@ async function flipkartScraper(req, res) {
 
         const page = await browser.newPage();
 
+        // ------------------------------
+        // NEW: Set global timeouts to 30s
+        // ------------------------------
+        page.setDefaultNavigationTimeout(30000);
+        page.setDefaultTimeout(30000);
+
 
         /*
         ========================================================
@@ -172,7 +176,7 @@ async function flipkartScraper(req, res) {
         */
 
         await page.setUserAgent(
-        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151.0.0.0 Safari/537.36'
+            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151.0.0.0 Safari/537.36'
         );
 
 
@@ -624,74 +628,85 @@ async function flipkartScraper(req, res) {
 
                 /*
                 =================================================
-                PAGE GOTO
+                PAGE GOTO – SINGLE ATTEMPT WITH 30s TIMEOUT
                 =================================================
                 */
 
                 let pageLoaded = false;
-                let lastError = null;
+                let loadError = null;
 
-                const gotoWithTimeout = async (page, url, timeout = 20000) => {
-                    return Promise.race([
-                        page.goto(url, {
-                            waitUntil: 'domcontentloaded',
-                            timeout: 0
-                        }),
+                try {
+                    console.log(
+                        `Loading product ${productId} (timeout: 30s)`
+                    );
 
-                        new Promise((_, reject) =>
-                            setTimeout(() => {
-                                reject(
-                                    new Error(`PAGE_TIMEOUT_${timeout}MS`)
-                                );
-                            }, timeout)
-                        )
-                    ]);
-                };
+                    await page.goto(productUrl, {
+                        waitUntil: 'domcontentloaded',
+                        timeout: 30000   // 30 seconds
+                    });
 
-                for (let attempt = 1; attempt <= 3; attempt++) {
-                    try {
-                        sendEvent('debug', {
-                            productNumber: currentProductNumber,
-                            productId,
-                            productCode,
-                            step: 'before_goto',
-                            url: productUrl
-                        });
+                    pageLoaded = true;
 
-                        await gotoWithTimeout(
-                            page,
-                            productUrl,
-                            20000
-                        );
-
-                        sendEvent('debug', {
-                            productNumber: currentProductNumber,
-                            productId,
-                            productCode,
-                            step: 'after_goto',
-                            currentUrl: page.url(),
-                            title: await page.title()
-                        });
-
-                        pageLoaded = true;
-
-                    } catch (error) {
-
-                        sendEvent('debug', {
-                            productNumber: currentProductNumber,
-                            productId,
-                            productCode,
-                            step: 'goto_failed',
-                            error: error.message
-                        });
-
-                        // இந்த product-ஐ skip பண்ணி next product
-                        continue;
-                    }
+                } catch (error) {
+                    loadError = error;
+                    console.error(
+                        `Page load failed for ${productId}:`,
+                        error.message
+                    );
                 }
 
+
+                // If the page did not load within 30s, skip this product
                 if (!pageLoaded) {
-                    throw lastError;
+                    // Mark as pending and update DB
+                    scrapeStatus = 'pending';
+                    modifiedDate = getCurrentIndTimeInfo('India_Railway_Date_Time');
+
+                    // Update DB to pending
+                    await executeMongoUpdate(
+                        {
+                            collection: 'ept_product_details_new_flipkart',
+                            cmpid
+                        },
+                        {
+                            [`${companyId}_product_id`]: productId,
+                            [`${companyId}_product_code`]: productCode
+                        },
+                        {
+                            $set: {
+                                product_scrape_status: 'pending',
+                                modified_date: modifiedDate
+                            }
+                        }
+                    );
+
+                    // Send error event and continue to next product
+                    sendEvent('product_error', {
+                        productNumber: currentProductNumber,
+                        totalProducts: ScrapingProductCount,
+                        productId,
+                        productCode,
+                        progress: Math.round((currentProductNumber / ScrapingProductCount) * 100),
+                        status: 'error',
+                        message: `Page load timeout (30s): ${loadError ? loadError.message : 'Unknown error'}`
+                    });
+
+                    // Still update progress in DB (if not single product)
+                    if (!isSingleProduct) {
+                        await updateEndTimeInDb(
+                            currentProductNumber,
+                            'running',
+                            cmpid,
+                            companyId,
+                            null,
+                            cronName,
+                            cronStartTime,
+                            ScrapingProductCount
+                        );
+                    }
+
+                    // Skip the rest of the scraping for this product
+                    continue;
                 }
 
 
@@ -723,16 +738,6 @@ async function flipkartScraper(req, res) {
 
                 const jsonLdExists =
                     await page.$('#jsonLD');
-
-                sendEvent('debug', {
-                    productNumber: currentProductNumber,
-                    productId,
-                    productCode,
-                    step: 'jsonld_check',
-                    jsonLdFound: !!jsonLdExists,
-                    currentUrl: page.url(),
-                    title: await page.title()
-                });
 
 
                 if (!jsonLdExists) {
@@ -1253,7 +1258,7 @@ async function flipkartScraper(req, res) {
 
                 /*
                 =================================================
-                PRODUCT ERROR
+                PRODUCT ERROR (unexpected)
                 =================================================
                 */
 
