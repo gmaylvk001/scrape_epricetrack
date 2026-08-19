@@ -1,4 +1,6 @@
-const puppeteer = require('puppeteer');
+const puppeteer = require('puppeteer-extra');
+const StealthPlugin = require('puppeteer-extra-plugin-stealth');
+puppeteer.use(StealthPlugin());
 const {
     getCurrentIndTimeInfo,
     updateStartTimeInDb,
@@ -144,16 +146,12 @@ async function flipkartScraper(req, res) {
                 process.env.PUPPETEER_EXECUTABLE_PATH || undefined,
 
             args: [
-                '--no-sandbox',
-                '--disable-setuid-sandbox',
-                '--disable-dev-shm-usage',
-                '--disable-gpu',
-                '--disable-software-rasterizer',
-                '--disable-extensions',
-                '--disable-background-networking',
-                '--disable-background-timer-throttling',
-                '--disable-renderer-backgrounding',
-                '--disable-features=Translate,BackForwardCache'
+            '--no-sandbox',
+            '--disable-setuid-sandbox',
+            '--disable-dev-shm-usage',
+            '--disable-gpu',
+            '--disable-blink-features=AutomationControlled', // <-- ADD THIS LINE
+            // ... keep your other args
             ],
 
             timeout: 30000
@@ -174,6 +172,12 @@ async function flipkartScraper(req, res) {
         USER AGENT
         ========================================================
         */
+
+        await page.setViewport({
+            width: 1366,
+            height: 768,
+            deviceScaleFactor: 1,
+        });
 
         await page.setUserAgent(
             'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151.0.0.0 Safari/537.36'
