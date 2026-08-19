@@ -636,10 +636,29 @@ async function flipkartScraper(req, res) {
                         console.log(
                             `Loading product ${productId} - Attempt ${attempt}/3`
                         );
+                        
+                        sendEvent('debug', {
+                            productNumber: currentProductNumber,
+                            productId,
+                            productCode,
+                            step: 'before_goto',
+                            url: productUrl,
+                            browserUserAgent: await page.evaluate(() => navigator.userAgent)
+                        });
 
                         await page.goto(productUrl, {
                             waitUntil: 'domcontentloaded',
                             timeout: 60000
+                        });
+
+                        sendEvent('debug', {
+                            productNumber: currentProductNumber,
+                            productId,
+                            productCode,
+                            step: 'after_goto',
+                            currentUrl: page.url(),
+                            title: await page.title(),
+                            browserUserAgent: await page.evaluate(() => navigator.userAgent)
                         });
 
                         pageLoaded = true;
@@ -694,6 +713,16 @@ async function flipkartScraper(req, res) {
 
                 const jsonLdExists =
                     await page.$('#jsonLD');
+
+                sendEvent('debug', {
+                    productNumber: currentProductNumber,
+                    productId,
+                    productCode,
+                    step: 'jsonld_check',
+                    jsonLdFound: !!jsonLdExists,
+                    currentUrl: page.url(),
+                    title: await page.title()
+                });
 
 
                 if (!jsonLdExists) {
