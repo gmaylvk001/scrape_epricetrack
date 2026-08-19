@@ -16,28 +16,22 @@ const {
 
 const cronName = 'flipkart';
 
-// ── Internal logger (emits 'log' events) ─────────────────────
+// ── Logger ──────────────────────────────────────────────────────
 class Logger extends EventEmitter {
     info(msg) { this.emit('log', { level: 'info', message: msg, timestamp: new Date() }); }
-    error(msg) { this.emit('log', { level: 'error', message: msg, timestamp: new Date() }); }
     warn(msg) { this.emit('log', { level: 'warn', message: msg, timestamp: new Date() }); }
+    error(msg) { this.emit('log', { level: 'error', message: msg, timestamp: new Date() }); }
 }
 const logger = new Logger();
-
-// Optional: listen to logs (e.g., write to file or debug console)
 logger.on('log', (entry) => {
-    // You can redirect to a logging service or just console
-    console[entry.level]?.(`[${entry.timestamp}] ${entry.message}`);
+    console[entry.level]?.(`[${entry.timestamp.toISOString()}] ${entry.message}`);
 });
 
-// ── Helper: delay ─────────────────────────────────────────────
 const delay = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 
-// ── Main scraper ──────────────────────────────────────────────
 async function flipkartScraper(req, res) {
     let browser;
 
-    // ── SSE sender ─────────────────────────────────────────────
     const sendEvent = (event, data) => {
         if (res.writableEnded) return;
         res.write(`event: ${event}\n`);
@@ -45,7 +39,6 @@ async function flipkartScraper(req, res) {
         if (typeof res.flush === 'function') res.flush();
     };
 
-    // ── Request validation ─────────────────────────────────────
     const cmpid = req.query.cmpid;
     if (!cmpid) {
         return res.status(400).json({ status: false, message: 'cmpid is required' });
@@ -55,7 +48,6 @@ async function flipkartScraper(req, res) {
     const itemcode = req.query.itemcode;
     const isSingleProduct = !!(ean && itemcode);
 
-    // ── SSE headers ─────────────────────────────────────────────
     res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
     res.setHeader('Cache-Control', 'no-cache, no-transform');
     res.setHeader('Connection', 'keep-alive');
@@ -63,14 +55,12 @@ async function flipkartScraper(req, res) {
     res.setHeader('Access-Control-Allow-Origin', '*');
     if (typeof res.flushHeaders === 'function') res.flushHeaders();
 
-    // ── Client disconnect ──────────────────────────────────────
     let clientDisconnected = false;
     req.on('close', () => {
         clientDisconnected = true;
-        logger.info('Flipkart client disconnected');
+        logger.info('Client disconnected');
     });
 
-    // ── Initial event ──────────────────────────────────────────
     sendEvent('start', {
         status: true,
         message: 'Flipkart scraping started',
@@ -80,7 +70,6 @@ async function flipkartScraper(req, res) {
     });
 
     try {
-        // ── Launch browser ──────────────────────────────────────
         logger.info('Launching browser...');
         browser = await puppeteer.launch({
             headless: true,
@@ -95,7 +84,7 @@ async function flipkartScraper(req, res) {
             timeout: 30000
         });
 
-        // ── Fetch products from DB ──────────────────────────────
+        // ── Fetch Products ──────────────────────────────────────
         const filter = {
             status: 'active',
             product_scrape_status: { $in: ['pending', 'completed'] },
@@ -118,7 +107,6 @@ async function flipkartScraper(req, res) {
             return;
         }
 
-        // ── Match with active products ──────────────────────────
         const existingProducts = await executeMongoFind(
             { collection: 'ept_product_details_new', cmpid },
             { status: 'active' },
@@ -136,7 +124,6 @@ async function flipkartScraper(req, res) {
             return;
         }
 
-        // ── Initialise scraping ──────────────────────────────────
         const total = productsToScrape.length;
         let processed = 0;
         const scrapedData = [];
@@ -155,7 +142,7 @@ async function flipkartScraper(req, res) {
             message: `${total} products found`
         });
 
-        // ── Scrape each product ──────────────────────────────────
+        // ── Product Loop ─────────────────────────────────────────
         for (const product of productsToScrape) {
             if (clientDisconnected) break;
 
@@ -169,16 +156,59 @@ async function flipkartScraper(req, res) {
             try {
                 hostname = new URL(productUrl).hostname;
             } catch {
-                logger.warn(`Invalid URL for product ${productId}`);
+                logger.warn(`Invalid URL for ${productId}`);
+                sendEvent('product', {
+                    productNumber: processed,
+                    totalProducts: total,
+                    processedProducts: processed,
+                    progress: Math.round((processed / total) * 100),
+                    productId,
+                    productCode,
+                    status: 'error',
+                    error: 'Invalid URL',
+                    data: null
+                });
                 continue;
             }
             if (!hostname.includes('flipkart')) {
                 logger.warn(`Non-Flipkart URL for ${productId}`);
+                sendEvent('product', {
+                    productNumber: processed,
+                    totalProducts: total,
+                    processedProducts: processed,
+                    progress: Math.round((processed / total) * 100),
+                    productId,
+                    productCode,
+                    status: 'error',
+                    error: 'Only Flipkart URLs supported',
+                    data: null
+                });
                 continue;
             }
 
-            // ── Per‑product page ──────────────────────────────────
+            // ── Step Event Helper ────────────────────────────────
+            const sendStep = (step, message, status = 'running') => {
+                sendEvent('step', {
+                    productNumber: processed,
+                    totalProducts: total,
+                    processedProducts: processed,
+                    progress: Math.round((processed / total) * 100),
+                    productId,
+                    productCode,
+                    step,
+                    status,
+                    message
+                });
+            };
+
+            // ── Create fresh page ────────────────────────────────
             const page = await browser.newPage();
+
+            // Warm-up
+            try {
+                await page.goto('about:blank', { waitUntil: 'domcontentloaded', timeout: 10000 });
+            } catch (_) { /* ignore */ }
+            await delay(1000);
 
             // Setup interception and headers
             await page.setRequestInterception(true);
@@ -209,16 +239,46 @@ async function flipkartScraper(req, res) {
             let modifiedDate;
 
             try {
-                // Navigate with domcontentloaded and 60s timeout
-                logger.info(`Loading ${productId} (${processed}/${total})`);
-                await page.goto(productUrl, { waitUntil: 'domcontentloaded', timeout: 60000 });
+                // ── Step: Loading Page ──────────────────────────
+                sendStep('page_loading', 'Opening Flipkart product page...');
 
-                // Check for JSON-LD
+                let pageLoaded = false;
+                let loadError = null;
+                let attempts = 0;
+                const maxAttempts = 2;
+
+                while (attempts < maxAttempts && !pageLoaded) {
+                    try {
+                        logger.info(`Loading ${productId} (${processed}/${total}) – attempt ${attempts+1}`);
+                        await page.goto(productUrl, {
+                            waitUntil: 'domcontentloaded',
+                            timeout: 60000
+                        });
+                        pageLoaded = true;
+                    } catch (err) {
+                        loadError = err;
+                        attempts++;
+                        if (attempts < maxAttempts) {
+                            logger.warn(`Retrying ${productId} after error: ${err.message}`);
+                            await delay(2000);
+                        }
+                    }
+                }
+
+                if (!pageLoaded) {
+                    throw loadError || new Error('Page load failed after retries');
+                }
+
+                sendStep('page_loaded', 'Flipkart page loaded', 'completed');
+
+                // ── Step: Extracting ──────────────────────────────
+                sendStep('extracting', 'Extracting product information...');
+
                 const jsonLdExists = await page.$('#jsonLD');
                 if (!jsonLdExists) {
                     logger.warn(`JSON-LD not found for ${productId}`);
+                    sendStep('extracting', 'JSON-LD not found', 'failed');
                 } else {
-                    // Extract data
                     const result = await page.evaluate(() => {
                         const jsonLd = document.querySelector('#jsonLD');
                         if (!jsonLd) return null;
@@ -252,12 +312,17 @@ async function flipkartScraper(req, res) {
                             varProductStock = 'Out Of Stock';
                         }
                         scrapeStatus = 'completed';
+                        sendStep('extracting', 'Product information extracted', 'completed');
+                    } else {
+                        sendStep('extracting', 'Product information not found', 'failed');
                     }
                 }
 
                 modifiedDate = getCurrentIndTimeInfo('India_Railway_Date_Time');
 
-                // Update price change
+                // ── Step: Updating Database ──────────────────────
+                sendStep('updating_db', 'Updating database...');
+
                 updatePriceChangeData(
                     scrapeStatus,
                     product.product_price,
@@ -269,7 +334,6 @@ async function flipkartScraper(req, res) {
                     companyId
                 );
 
-                // Update DB
                 await executeMongoUpdate(
                     { collection: 'ept_product_details_new_flipkart', cmpid },
                     { [`${companyId}_product_id`]: productId, [`${companyId}_product_code`]: productCode },
@@ -286,6 +350,9 @@ async function flipkartScraper(req, res) {
                     }
                 );
 
+                sendStep('updating_db', 'Database updated', 'completed');
+
+                // ── Build result ──────────────────────────────────
                 const productResult = {
                     product_ean_id: productId,
                     product_code: productCode,
@@ -296,7 +363,7 @@ async function flipkartScraper(req, res) {
                 };
                 scrapedData.push(productResult);
 
-                // ── Send product result event ──────────────────────
+                // ── Product event (success) ──────────────────────
                 sendEvent('product', {
                     productNumber: processed,
                     totalProducts: total,
@@ -304,18 +371,18 @@ async function flipkartScraper(req, res) {
                     progress: Math.round((processed / total) * 100),
                     productId,
                     productCode,
-                    status: scrapeStatus === 'completed' ? 'success' : 'pending',
+                    status: 'success',
                     data: productResult
                 });
 
-                // Update cron progress
                 if (!isSingleProduct) {
                     await updateEndTimeInDb(processed, 'running', cmpid, companyId, null, cronName, cronStartTime, total);
                 }
 
             } catch (err) {
                 logger.error(`Error scraping ${productId}: ${err.message}`);
-                // Mark as pending in DB
+                sendStep('error', err.message || 'Scraping failed', 'error');
+
                 try {
                     await executeMongoUpdate(
                         { collection: 'ept_product_details_new_flipkart', cmpid },
@@ -331,7 +398,6 @@ async function flipkartScraper(req, res) {
                     logger.error(`DB update error for ${productId}: ${dbErr.message}`);
                 }
 
-                // Send product error event (still a 'product' event with error flag)
                 sendEvent('product', {
                     productNumber: processed,
                     totalProducts: total,
@@ -343,15 +409,18 @@ async function flipkartScraper(req, res) {
                     error: err.message || 'Scraping failed',
                     data: null
                 });
+
+                if (!isSingleProduct) {
+                    await updateEndTimeInDb(processed, 'running', cmpid, companyId, null, cronName, cronStartTime, total);
+                }
             } finally {
                 await page.close().catch(() => {});
             }
 
-            // Small delay between products
             await delay(100);
         }
 
-        // ── Final summary ────────────────────────────────────────
+        // ── Final summary ─────────────────────────────────────────
         const endTime = new Date(`${getCurrentIndTimeInfo('India_Railway_Date_Only')}T${getCurrentIndTimeInfo('India_Railway_Time')}`);
         const totalMins = +((endTime - startTime) / 60000).toFixed(2);
 
