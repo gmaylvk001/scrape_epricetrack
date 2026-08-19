@@ -648,7 +648,7 @@ async function flipkartScraper(req, res) {
 
                         await page.goto(productUrl, {
                             waitUntil: 'domcontentloaded',
-                            timeout: 60000
+                            timeout: 20000
                         });
 
                         sendEvent('debug', {
@@ -668,11 +668,17 @@ async function flipkartScraper(req, res) {
 
                         lastError = error;
 
-                        console.error(
-                            `Page load failed - Attempt ${attempt}/3`,
+                        sendEvent('debug', {
+                            attempt:`Page load failed - Attempt ${attempt}/3`,
                             productId,
-                            error.message
-                        );
+                            error : error.message,
+                            productNumber: currentProductNumber,
+                            productId,
+                            productCode,
+                            step: 'before_goto',
+                            url: productUrl,
+                            browserUserAgent: await page.evaluate(() => navigator.userAgent)
+                        });
 
                         if (attempt < 3) {
                             await delay(3000);
