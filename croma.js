@@ -159,11 +159,17 @@ async function cromaScraper(req, res) {
             timeout: 30000
         });
 
-        // Create the main page that will be used for pincode only
-        const mainPage = await browser.newPage();
 
-        // Set user agent on the main page
-        await mainPage.setUserAgent(
+        const page = await browser.newPage();
+
+
+        /*
+        ========================================================
+        USER AGENT
+        ========================================================
+        */
+
+        await page.setUserAgent(
             'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36'
         );
 
@@ -422,7 +428,7 @@ async function cromaScraper(req, res) {
 
         /*
         ========================================================
-        SET PINCODE (using mainPage)
+        SET PINCODE
         ========================================================
         */
 
@@ -438,14 +444,14 @@ async function cromaScraper(req, res) {
 
             const productUrltest = "https://www.croma.com/";
 
-            await mainPage.goto(productUrltest, {
+            await page.goto(productUrltest, {
                 waitUntil: 'networkidle2',
                 timeout: 50000
             });
 
             await delay(3000);
 
-            if (await mainPage.$('.pinElem') === null) {
+            if (await page.$('.pinElem') === null) {
 
                 console.log('Croma pincode popup not found, continuing...');
 
@@ -457,23 +463,23 @@ async function cromaScraper(req, res) {
 
             } else {
 
-                await mainPage.waitForSelector('.pinElem', {
+                await page.waitForSelector('.pinElem', {
                     visible: true,
                     timeout: 15000
                 });
 
-                const input = await mainPage.$('.pinElem');
+                const input = await page.$('.pinElem');
 
                 const existingPincode = await input.evaluate(el => el.value);
 
                 // Select existing pincode
                 await input.click({ clickCount: 3 });
 
-                await mainPage.keyboard.down('Control');
-                await mainPage.keyboard.press('A');
-                await mainPage.keyboard.up('Control');
+                await page.keyboard.down('Control');
+                await page.keyboard.press('A');
+                await page.keyboard.up('Control');
 
-                await mainPage.keyboard.press('Backspace');
+                await page.keyboard.press('Backspace');
 
                 // Enter new pincode
                 if(pincode){
@@ -499,10 +505,10 @@ async function cromaScraper(req, res) {
                 const enteredPincode = await input.evaluate(el => el.value);
 
                 // Click Continue
-                await mainPage.click('#apply-pincode-btn');
+                await page.click('#apply-pincode-btn');
 
                 // Wait until popup is hidden
-                await mainPage.waitForFunction(() => {
+                await page.waitForFunction(() => {
                     const dialog = document.querySelector('.MuiDialog-root');
 
                     if (!dialog) return true;
@@ -513,7 +519,7 @@ async function cromaScraper(req, res) {
                 });
 
                 // Wait for page/network update
-                await mainPage.waitForNetworkIdle({
+                await page.waitForNetworkIdle({
                     idleTime: 2000,
                     timeout: 50000
                 });
@@ -538,16 +544,13 @@ async function cromaScraper(req, res) {
             });
         }
 
-        // ----- CLOSE THE MAIN PAGE AFTER PINCODE IS SET (OR FAILED) -----
-        await mainPage.close().catch(err => console.error('Error closing main page:', err));
-
 
         const scrapedData = [];
 
 
         /*
         ========================================================
-        PRODUCT LOOP – each product uses its own page
+        PRODUCT LOOP
         ========================================================
         */
 
@@ -718,14 +721,9 @@ async function cromaScraper(req, res) {
 
             /*
             ====================================================
-            CREATE A NEW PAGE FOR THIS PRODUCT
+            PRODUCT SCRAPING
             ====================================================
             */
-
-            const productPage = await browser.newPage();
-            await productPage.setUserAgent(
-                'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36'
-            );
 
             try {
 
@@ -749,11 +747,11 @@ async function cromaScraper(req, res) {
 
                 /*
                 =================================================
-                PAGE GOTO on productPage
+                PAGE GOTO
                 =================================================
                 */
 
-                await productPage.goto(productUrl, {
+                await page.goto(productUrl, {
 
                     waitUntil:
                         'networkidle2',
@@ -785,12 +783,12 @@ async function cromaScraper(req, res) {
 
                 /*
                 =================================================
-                PRODUCT TITLE CHECK on productPage
+                PRODUCT TITLE CHECK
                 =================================================
                 */
 
                 const productTitleExists =
-                    await productPage.$('.pd-title-normal');
+                    await page.$('.pd-title-normal');
 
 
                 if (!productTitleExists) {
@@ -838,7 +836,7 @@ async function cromaScraper(req, res) {
 
                     /*
                     =============================================
-                    EXTRACT PRODUCT DATA on productPage
+                    EXTRACT PRODUCT DATA
                     =============================================
                     */
 
@@ -862,13 +860,13 @@ async function cromaScraper(req, res) {
                     });
 
 
-                    await productPage.waitForSelector(
+                    await page.waitForSelector(
                         'script[type="application/ld+json"], [class*="pd-title-normal"], .pd-title-normal',
                         { timeout: 30000 }
                     );
 
 
-                    const result = await productPage.evaluate(() => {
+                    const result = await page.evaluate(() => {
 
                         const productData = [...document.querySelectorAll('script[type="application/ld+json"]')]
                             .map(script => {
@@ -1362,17 +1360,6 @@ async function cromaScraper(req, res) {
                         dbError
                     );
                 }
-            } finally {
-
-                /*
-                =================================================
-                CLOSE THE PRODUCT PAGE AFTER EACH ITERATION
-                =================================================
-                */
-
-                await productPage.close().catch(err => {
-                    console.error('Error closing product page:', err);
-                });
             }
 
 
@@ -1516,7 +1503,7 @@ async function cromaScraper(req, res) {
 
         /*
         ========================================================
-        CLOSE BROWSER – all pages are closed with it
+        CLOSE BROWSER
         ========================================================
         */
 
