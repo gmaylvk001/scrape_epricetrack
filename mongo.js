@@ -30,6 +30,11 @@ async function getMongoDb(cmpid) {
     return client.db(cmpid);
 }
 
+async function getMainDb() {
+    await connectMongo();
+    return client.db('plm_admin_manage_info');
+}
+
 // ---------------- FIND ----------------
 
 async function executeMongoFind(
@@ -143,6 +148,7 @@ async function closeMongo() {
 module.exports = {
     connectMongo,
     getMongoDb,
+    getMainDb,
     executeMongoFind,
     executeMongoCount,
     executeMongoUpdate,
