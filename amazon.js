@@ -6,12 +6,15 @@ const {
 } = require('./utils/cronTime');
 
 const { updatePriceChangeData } = require('./utils/priceChange');
+const { getStorePincode } = require('./utils/pinCode');
+const { PincodeApplied } = require('./utils/pincodeApplied');
 
 const {
     executeMongoFind,
     executeMongoCount,
     executeMongoUpdate
 } = require('./mongo');
+
 
 const cronName = 'amazon';
 
@@ -63,6 +66,7 @@ async function amazonScraper(req, res) {
 
     const ean = req.query.ean;
     const itemcode = req.query.itemcode;
+    const pincode = req.query.pincode || '110001'; // Default pincode if not provided
 
     const isSingleProduct = !!(ean && itemcode);
 
@@ -117,7 +121,8 @@ async function amazonScraper(req, res) {
         message: 'Amazon scraping started',
         cmpid,
         companyId,
-        isSingleProduct
+        isSingleProduct,
+        pincode
     });
 
 
@@ -138,7 +143,7 @@ async function amazonScraper(req, res) {
 
         browser = await puppeteer.launch({
 
-            headless: true,
+            headless: false,
 
             executablePath:
                 process.env.PUPPETEER_EXECUTABLE_PATH || undefined,
@@ -158,20 +163,6 @@ async function amazonScraper(req, res) {
 
             timeout: 30000
         });
-
-
-        const page = await browser.newPage();
-
-
-        /*
-        ========================================================
-        USER AGENT
-        ========================================================
-        */
-
-        await page.setUserAgent(
-            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36'
-        );
 
 
         /*
@@ -420,12 +411,51 @@ async function amazonScraper(req, res) {
         });
 
 
-        const scrapedData = [];
+        // Get the database pincode once
+        let dbPincode = await getStorePincode(companyId);
+        if (dbPincode === null) {
+            dbPincode = req.query.pincode || '600008';
+        }
 
+        const homepage = "https://www.amazon.in/";
+
+        const pincodeSelectors = {
+            container  : '#nav-global-location-data-modal-action',
+            inputfiled : '#GLUXZipUpdateInput',
+            applyfield : '#GLUXZipUpdate-announce'
+        };
+
+        // Variable to track current pincode applied on the website
+        let currentAppliedPincode = dbPincode;
+
+        sendEvent('step', {
+            step: 'pincode',
+            status: 'running',
+            message: `Initial pincode set to: ${dbPincode}`
+        });
+
+        // Apply initial pincode
+        const initialPincodeResult = await PincodeApplied(
+            browser,
+            dbPincode,
+            cronName,
+            homepage,
+            pincodeSelectors,
+            sendEvent
+        );
+
+        if (initialPincodeResult.success) {
+            currentAppliedPincode = initialPincodeResult.pincode || dbPincode;
+            console.log('Initial pincode applied:', currentAppliedPincode);
+        } else {
+            console.log('Initial pincode was not applied:', initialPincodeResult.message);
+        }
+
+        const scrapedData = [];
 
         /*
         ========================================================
-        PRODUCT LOOP
+        PRODUCT LOOP - ONE PRODUCT PER BROWSER
         ========================================================
         */
 
@@ -593,6 +623,8 @@ async function amazonScraper(req, res) {
 
             let modifiedDate;
 
+            // Create a new page for each product
+            let page = null;
 
             /*
             ====================================================
@@ -619,21 +651,167 @@ async function amazonScraper(req, res) {
                         'Opening Amazon product page...'
                 });
 
+                // Create new page for this product
+                page = await browser.newPage();
 
-                /*
-                =================================================
-                PAGE GOTO
-                =================================================
-                */
+                // Set user agent for each page
+                await page.setUserAgent(
+                    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36'
+                );
 
-                await page.goto(productUrl, {
-
-                    waitUntil:
-                        'networkidle2',
-
-                    timeout:
-                        50000
+                // Set viewport
+                await page.setViewport({
+                    width: 1366,
+                    height: 768
                 });
+
+                // Check if it's amazon.in
+                if (hostname.includes('amazon.in')) {
+
+                    sendEvent('product_step', {
+
+                        productNumber:
+                            currentProductNumber,
+
+                        productId,
+
+                        productCode,
+
+                        step: 'pincode_check',
+
+                        status: 'running',
+
+                        message:
+                            `Checking pincode for amazon.in... Expected: ${dbPincode}, Current: ${currentAppliedPincode}`
+                    });
+
+                    // First navigate to the product page
+                    await page.goto(productUrl, {
+
+                        waitUntil: 'networkidle2',
+
+                        timeout: 50000
+                    });
+
+                    // Check if the current pincode on the website matches the database pincode
+                    // This can be done by checking the location display element
+                    const currentPincodeOnWebsite = await page.evaluate(() => {
+                        const locationElement = document.querySelector('#glow-ingress-line2');
+                        if (locationElement) {
+                            const text = locationElement.textContent.trim();
+                            // Extract pincode from text like "Delhi 110001"
+                            const match = text.match(/\d{6}/);
+                            return match ? match[0] : null;
+                        }
+                        return null;
+                    });
+
+                    console.log(`Current website pincode: ${currentPincodeOnWebsite}, Database pincode: ${dbPincode}`);
+
+                    // If pincode doesn't match or couldn't be retrieved, reapply it
+                    if (currentPincodeOnWebsite !== dbPincode) {
+                        sendEvent('product_step', {
+
+                            productNumber:
+                                currentProductNumber,
+
+                            productId,
+
+                            productCode,
+
+                            step: 'pincode_reapplying',
+
+                            status: 'running',
+
+                            message:
+                                `Pincode mismatch. Reapplying pincode ${dbPincode}...`
+                        });
+
+                        // Reapply pincode
+                        const pincodeResult = await PincodeApplied(
+                            browser,
+                            dbPincode,
+                            cronName,
+                            homepage,
+                            pincodeSelectors,
+                            sendEvent,
+                            page // Pass the current page
+                        );
+
+                        if (pincodeResult.success) {
+                            currentAppliedPincode = pincodeResult.pincode || dbPincode;
+                            console.log('Pincode reapplied successfully:', currentAppliedPincode);
+                            
+                            sendEvent('product_step', {
+
+                                productNumber:
+                                    currentProductNumber,
+
+                                productId,
+
+                                productCode,
+
+                                step: 'pincode_reapplied',
+
+                                status: 'completed',
+
+                                message:
+                                    `Pincode reapplied successfully: ${currentAppliedPincode}`
+                            });
+
+                            // Refresh the page after pincode change
+                            await page.reload({
+                                waitUntil: 'networkidle2',
+                                timeout: 50000
+                            });
+                        } else {
+                            console.log('Pincode reapplication failed:', pincodeResult.message);
+                            
+                            sendEvent('product_step', {
+
+                                productNumber:
+                                    currentProductNumber,
+
+                                productId,
+
+                                productCode,
+
+                                step: 'pincode_reapply_failed',
+
+                                status: 'warning',
+
+                                message:
+                                    `Pincode reapplication failed: ${pincodeResult.message}`
+                            });
+                        }
+                    } else {
+                        sendEvent('product_step', {
+
+                            productNumber:
+                                currentProductNumber,
+
+                            productId,
+
+                            productCode,
+
+                            step: 'pincode_match',
+
+                            status: 'completed',
+
+                            message:
+                                `Pincode matches: ${currentPincodeOnWebsite}`
+                        });
+                    }
+
+                } else {
+                    // For non-amazon.in sites, just navigate
+                    await page.goto(productUrl, {
+
+                        waitUntil: 'networkidle2',
+
+                        timeout: 50000
+                    });
+                }
 
 
                 sendEvent('product_step', {
@@ -748,8 +926,24 @@ async function amazonScraper(req, res) {
                                 return el ? el.getAttribute(attr) : '';
                             };
 
+                            // Try multiple price selectors
+                            let price = getText('#apex-pricetopay-accessibility-label');
+                            if (!price) {
+                                price = getText('#priceblock_ourprice');
+                            }
+                            if (!price) {
+                                price = getText('#priceblock_dealprice');
+                            }
+                            if (!price) {
+                                price = getText('.a-price-whole');
+                                const fraction = document.querySelector('.a-price-fraction');
+                                if (price && fraction) {
+                                    price = price + '.' + fraction.textContent.trim();
+                                }
+                            }
+
                             return {
-                                price: getText('#apex-pricetopay-accessibility-label'),
+                                price: price,
                                 image: getAttr('#landingImage', 'src'),
                                 review: getText('#acrCustomerReviewText') || 0,
                                 rating: getText('.mvt-cm-cr-review-stars-mini-popover span') || 0
@@ -1176,16 +1370,43 @@ async function amazonScraper(req, res) {
                         dbError
                     );
                 }
+
+            } finally {
+
+                /*
+                =================================================
+                CLOSE PAGE AFTER EACH PRODUCT
+                =================================================
+                */
+
+                if (page) {
+
+                    console.log(
+                        `Closing page for product ${productId}...`
+                    );
+
+                    try {
+
+                        await page.close();
+
+                    } catch (error) {
+
+                        console.error(
+                            'Page close error:',
+                            error
+                        );
+                    }
+                }
             }
 
 
             /*
             ====================================================
-            SMALL DELAY
+            SMALL DELAY BETWEEN PRODUCTS
             ====================================================
             */
 
-            await delay(100);
+            await delay(500);
 
 
         }
