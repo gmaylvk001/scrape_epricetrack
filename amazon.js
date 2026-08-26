@@ -143,7 +143,7 @@ async function amazonScraper(req, res) {
 
         browser = await puppeteer.launch({
 
-            headless: false,
+            headless: true,
 
             executablePath:
                 process.env.PUPPETEER_EXECUTABLE_PATH || undefined,
