@@ -15,8 +15,43 @@ const {
     executeMongoUpdate
 } = require('./mongo');
 
-
 const cronName = 'amazon';
+
+// Configuration constants
+const CONFIG = {
+    MAX_CONCURRENT_PAGES: 2, // Reduced to prevent memory issues
+    PAGE_TIMEOUT: 45000,
+    DELAY_BETWEEN_PRODUCTS: 500,
+    MONGO_RETRY_DELAY: 2000,
+    MAX_MONGO_RETRIES: 3,
+    BROWSER_ARGS: [
+        '--no-sandbox',
+        '--disable-setuid-sandbox',
+        '--disable-dev-shm-usage',
+        '--disable-gpu',
+        '--disable-software-rasterizer',
+        '--disable-extensions',
+        '--disable-background-networking',
+        '--disable-background-timer-throttling',
+        '--disable-renderer-backgrounding',
+        '--disable-features=Translate,BackForwardCache',
+        '--js-flags=--max-old-space-size=512',
+        '--memory-pressure-off',
+        '--disable-ipc-flooding-protection',
+        '--disable-backgrounding-occluded-windows',
+        '--disable-breakpad',
+        '--disable-component-extensions-with-background-pages',
+        '--disable-default-apps',
+        '--disable-domain-reliability',
+        '--disable-file-system',
+        '--disable-local-storage',
+        '--disable-session-crashed-bubble',
+        '--disable-translate',
+        '--disable-web-security',
+        '--disable-features=IsolateOrigins,site-per-process',
+        '--max_old_space_size=512'
+    ]
+};
 
 async function amazonScraper(req, res) {
 
@@ -24,6 +59,8 @@ async function amazonScraper(req, res) {
         new Promise(resolve => setTimeout(resolve, ms));
 
     let browser;
+    let pagePool = [];
+    let isShuttingDown = false;
 
     /*
     ============================================================
@@ -33,19 +70,144 @@ async function amazonScraper(req, res) {
 
     const sendEvent = (event, data) => {
 
-        if (res.writableEnded) {
+        if (res.writableEnded || isShuttingDown) {
             return;
         }
 
-        res.write(`event: ${event}\n`);
-        res.write(`data: ${JSON.stringify(data)}\n\n`);
+        try {
+            res.write(`event: ${event}\n`);
+            res.write(`data: ${JSON.stringify(data)}\n\n`);
 
-        // Make sure data is flushed
-        if (typeof res.flush === 'function') {
-            res.flush();
+            if (typeof res.flush === 'function') {
+                res.flush();
+            }
+        } catch (error) {
+            console.error('Error sending event:', error.message);
         }
     };
 
+    /*
+    ============================================================
+    SAFE MONGO OPERATIONS WITH RETRY
+    ============================================================
+    */
+
+    async function safeMongoFind(collection, filter, projection, retries = CONFIG.MAX_MONGO_RETRIES) {
+        for (let attempt = 1; attempt <= retries; attempt++) {
+            try {
+                return await executeMongoFind(collection, filter, projection);
+            } catch (error) {
+                console.error(`MongoDB find attempt ${attempt} failed:`, error.message);
+                
+                if (attempt === retries) {
+                    throw error;
+                }
+                
+                // Wait before retry
+                await delay(CONFIG.MONGO_RETRY_DELAY * attempt);
+            }
+        }
+    }
+
+    async function safeMongoUpdate(collection, filter, update, retries = CONFIG.MAX_MONGO_RETRIES) {
+        for (let attempt = 1; attempt <= retries; attempt++) {
+            try {
+                return await executeMongoUpdate(collection, filter, update);
+            } catch (error) {
+                console.error(`MongoDB update attempt ${attempt} failed:`, error.message);
+                
+                if (attempt === retries) {
+                    throw error;
+                }
+                
+                await delay(CONFIG.MONGO_RETRY_DELAY * attempt);
+            }
+        }
+    }
+
+    /*
+    ============================================================
+    PAGE POOL MANAGEMENT
+    ============================================================
+    */
+    
+    const getPageFromPool = async () => {
+        while (pagePool.length > 0) {
+            const page = pagePool.pop();
+            try {
+                await page.evaluate(() => 1);
+                return page;
+            } catch (error) {
+                try { await page.close(); } catch (e) {}
+            }
+        }
+        
+        const newPage = await browser.newPage();
+        
+        // Optimize page settings
+        await newPage.setRequestInterception(true);
+        
+        // Block unnecessary resources
+        newPage.on('request', (req) => {
+            const resourceType = req.resourceType();
+            if (['image', 'font', 'stylesheet', 'media'].includes(resourceType)) {
+                req.abort();
+            } else {
+                req.continue();
+            }
+        });
+        
+        await newPage.setUserAgent(
+            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36'
+        );
+        
+        await newPage.setViewport({
+            width: 1366,
+            height: 768
+        });
+        
+        // Disable unnecessary features
+        await newPage.evaluateOnNewDocument(() => {
+            const style = document.createElement('style');
+            style.textContent = `
+                * {
+                    animation-duration: 0s !important;
+                    transition-duration: 0s !important;
+                }
+            `;
+            document.head.appendChild(style);
+            
+            // Prevent infinite scrolling
+            window.addEventListener('scroll', (e) => {
+                e.stopPropagation();
+            }, true);
+        });
+        
+        return newPage;
+    };
+    
+    const returnPageToPool = (page) => {
+        if (page && !page.isClosed() && !isShuttingDown) {
+            try {
+                page.evaluate(() => {
+                    if (window.performance && window.performance.navigation) {
+                        window.performance.navigation.type = 2;
+                    }
+                    if (window._cf) delete window._cf;
+                    if (window._csrf) delete window._csrf;
+                }).catch(() => {});
+                
+                page.goto('about:blank', { waitUntil: 'domcontentloaded' })
+                    .catch(() => {});
+            } catch (e) {}
+            
+            if (pagePool.length < CONFIG.MAX_CONCURRENT_PAGES) {
+                pagePool.push(page);
+            } else {
+                page.close().catch(() => {});
+            }
+        }
+    };
 
     /*
     ============================================================
@@ -66,55 +228,60 @@ async function amazonScraper(req, res) {
 
     const ean = req.query.ean;
     const itemcode = req.query.itemcode;
-    const pincode = req.query.pincode || '110001'; // Default pincode if not provided
+    const pincode = req.query.pincode || '110001';
 
     const isSingleProduct = !!(ean && itemcode);
-
-
-    /*
-    ============================================================
-    SSE HEADERS
-    ============================================================
-    */
 
     res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
     res.setHeader('Cache-Control', 'no-cache, no-transform');
     res.setHeader('Connection', 'keep-alive');
-
-    // Important for nginx / reverse proxy buffering
     res.setHeader('X-Accel-Buffering', 'no');
-
-    // CORS
     res.setHeader('Access-Control-Allow-Origin', '*');
 
     if (typeof res.flushHeaders === 'function') {
         res.flushHeaders();
     }
 
-
-    /*
-    ============================================================
-    CLIENT DISCONNECT HANDLING
-    ============================================================
-    */
-
     let clientDisconnected = false;
 
     req.on('close', () => {
-
         clientDisconnected = true;
-
-        console.log(
-            'Amazon client disconnected'
-        );
+        console.log('Amazon client disconnected');
     });
-
 
     /*
     ============================================================
-    INITIAL RESPONSE
+    SAFE SHUTDOWN
     ============================================================
     */
+
+    const gracefulShutdown = async () => {
+        if (isShuttingDown) return;
+        isShuttingDown = true;
+        
+        console.log('Starting graceful shutdown...');
+        
+        // Close all pages
+        while (pagePool.length > 0) {
+            const page = pagePool.pop();
+            try {
+                if (!page.isClosed()) {
+                    await page.close();
+                }
+            } catch (error) {
+                console.error('Page close error:', error);
+            }
+        }
+
+        if (browser) {
+            console.log('Closing browser...');
+            try {
+                await browser.close();
+            } catch (error) {
+                console.error('Browser close error:', error);
+            }
+        }
+    };
 
     sendEvent('start', {
         status: true,
@@ -125,51 +292,25 @@ async function amazonScraper(req, res) {
         pincode
     });
 
-
     try {
-
-        /*
-        ========================================================
-        LAUNCH BROWSER
-        ========================================================
-        */
-
         sendEvent('step', {
             step: 'browser',
             status: 'running',
             message: 'Launching browser...'
         });
 
-
         browser = await puppeteer.launch({
-
             headless: true,
-
-            executablePath:
-                process.env.PUPPETEER_EXECUTABLE_PATH || undefined,
-
-            args: [
-                '--no-sandbox',
-                '--disable-setuid-sandbox',
-                '--disable-dev-shm-usage',
-                '--disable-gpu',
-                '--disable-software-rasterizer',
-                '--disable-extensions',
-                '--disable-background-networking',
-                '--disable-background-timer-throttling',
-                '--disable-renderer-backgrounding',
-                '--disable-features=Translate,BackForwardCache'
+            executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || undefined,
+            args: CONFIG.BROWSER_ARGS,
+            timeout: 30000,
+            devtools: false,
+            ignoreDefaultArgs: [
+                '--enable-automation',
+                '--disable-web-security'
             ],
-
-            timeout: 30000
+            defaultViewport: null
         });
-
-
-        /*
-        ========================================================
-        GET PRODUCTS
-        ========================================================
-        */
 
         sendEvent('step', {
             step: 'products',
@@ -177,1240 +318,504 @@ async function amazonScraper(req, res) {
             message: 'Fetching Amazon products...'
         });
 
-
         const filter = {
-
             status: 'active',
-
             product_scrape_status: {
                 $in: ['pending', 'completed']
             },
-
             product_url: {
                 $nin: ['', null, 'No Result']
             }
         };
 
-
-        /*
-        ========================================================
-        SINGLE PRODUCT FILTER
-        ========================================================
-        */
-
         if (isSingleProduct) {
-
             filter[`${companyId}_product_id`] = ean;
-
             filter[`${companyId}_product_code`] = itemcode;
         }
 
-
-        /*
-        ========================================================
-        GET AMAZON PRODUCTS
-        ========================================================
-        */
-
-        const products = await executeMongoFind(
-
-            {
-                collection:
-                    'ept_product_details_new_amazon',
-
-                cmpid
-            },
-
-            filter,
-
-            {
-                _id: 0
-            }
-        );
-
+        // Use safe MongoDB operations with retry
+        let products;
+        try {
+            products = await safeMongoFind(
+                {
+                    collection: 'ept_product_details_new_amazon',
+                    cmpid
+                },
+                filter,
+                { _id: 0 }
+            );
+        } catch (error) {
+            console.error('Failed to fetch products from MongoDB:', error);
+            sendEvent('error', {
+                status: false,
+                message: 'Database connection error. Please try again.'
+            });
+            res.end();
+            return;
+        }
 
         if (!products || products.length === 0) {
-
             sendEvent('complete', {
-
                 status: true,
-
-                message:
-                    'Competitor products not found',
-
-                totalProcessed: 0,
-
-                data: []
+                message: 'Competitor products not found',
+                totalProcessed: 0
             });
-
             res.end();
-
             return;
         }
 
-
-        /*
-        ========================================================
-        GET EXISTING PRODUCTS
-        ========================================================
-        */
-
-        const existingProducts = await executeMongoFind(
-
-            {
-                collection:
-                    'ept_product_details_new',
-
-                cmpid
-            },
-
-            {
-                $and: [
-                    {
-                        status: 'active'
-                    }
-                ]
-            },
-
-            {
-                _id: 0,
-
-                product_ean_id: 1,
-
-                product_code: 1
-            }
-        );
-
-
-        /*
-        ========================================================
-        CREATE PRODUCT MAP
-        ========================================================
-        */
+        let existingProducts;
+        try {
+            existingProducts = await safeMongoFind(
+                {
+                    collection: 'ept_product_details_new',
+                    cmpid
+                },
+                { status: 'active' },
+                {
+                    _id: 0,
+                    product_ean_id: 1,
+                    product_code: 1
+                }
+            );
+        } catch (error) {
+            console.error('Failed to fetch existing products:', error);
+            // Continue with empty existing products
+            existingProducts = [];
+        }
 
         const productMap = new Set();
-
-
         existingProducts.forEach((row) => {
-
-            const key =
-                `${row.product_ean_id}_${row.product_code}`;
-
-            productMap.add(key);
+            productMap.add(`${row.product_ean_id}_${row.product_code}`);
         });
 
-
-        /*
-        ========================================================
-        FILTER MATCHING PRODUCTS
-        ========================================================
-        */
-
-        const ArrGetProductInfo = [];
-
-
-        products.forEach((arrTmp) => {
-
-            const key =
-                `${arrTmp[`${companyId}_product_id`]}_${arrTmp[`${companyId}_product_code`]}`;
-
-
-            if (productMap.has(key)) {
-
-                ArrGetProductInfo.push(arrTmp);
-            }
+        const ArrGetProductInfo = products.filter((arrTmp) => {
+            const key = `${arrTmp[`${companyId}_product_id`]}_${arrTmp[`${companyId}_product_code`]}`;
+            return productMap.has(key);
         });
 
+        products.length = 0;
+        existingProducts.length = 0;
 
         if (ArrGetProductInfo.length === 0) {
-
             sendEvent('complete', {
-
                 status: true,
-
-                message:
-                    'Active products not found',
-
-                totalProcessed: 0,
-
-                data: []
+                message: 'Active products not found',
+                totalProcessed: 0
             });
-
             res.end();
-
             return;
         }
 
-
-        /*
-        ========================================================
-        SCRAPING INITIALIZATION
-        ========================================================
-        */
-
         let productCount = 0;
-
-        const ScrapingProductCount =
-            ArrGetProductInfo.length;
-
-
-        const startTime =
-            new Date(
-                `${getCurrentIndTimeInfo(
-                    'India_Railway_Date_Only'
-                )}T${getCurrentIndTimeInfo(
-                    'India_Railway_Time'
-                )}`
-            );
-
-
-        const cronStartTime =
-            getCurrentIndTimeInfo();
-
-
-        /*
-        ========================================================
-        UPDATE START TIME
-        ========================================================
-        */
+        let successfulScrapes = 0;
+        let failedScrapes = 0;
+        const ScrapingProductCount = ArrGetProductInfo.length;
+        const startTime = new Date(`${getCurrentIndTimeInfo('India_Railway_Date_Only')}T${getCurrentIndTimeInfo('India_Railway_Time')}`);
+        const cronStartTime = getCurrentIndTimeInfo();
 
         if (!isSingleProduct) {
-
-            await updateStartTimeInDb(
-
-                cmpid,
-
-                companyId,
-
-                cronName,
-
-                ScrapingProductCount
-            );
+            try {
+                await updateStartTimeInDb(cmpid, companyId, cronName, ScrapingProductCount);
+            } catch (error) {
+                console.error('Failed to update start time:', error);
+            }
         }
 
-
-        /*
-        ========================================================
-        SEND PRODUCT COUNT
-        ========================================================
-        */
-
         sendEvent('progress', {
-
             status: 'running',
-
-            totalProducts:
-                ScrapingProductCount,
-
+            totalProducts: ScrapingProductCount,
             processedProducts: 0,
-
             progress: 0,
-
-            message:
-                `${ScrapingProductCount} products found`
+            message: `${ScrapingProductCount} products found`
         });
 
-
-        // Get the database pincode once
         let dbPincode = await getStorePincode(companyId);
         if (dbPincode === null) {
             dbPincode = req.query.pincode || '600008';
         }
 
         const homepage = "https://www.amazon.in/";
-
         const pincodeSelectors = {
-            container  : '#nav-global-location-data-modal-action',
-            inputfiled : '#GLUXZipUpdateInput',
-            applyfield : '#GLUXZipUpdate-announce'
+            container: '#nav-global-location-data-modal-action',
+            inputfiled: '#GLUXZipUpdateInput',
+            applyfield: '#GLUXZipUpdate-announce'
         };
 
-        // Variable to track current pincode applied on the website
         let currentAppliedPincode = dbPincode;
 
-        sendEvent('step', {
-            step: 'pincode',
-            status: 'running',
-            message: `Initial pincode set to: ${dbPincode}`
-        });
+        try {
+            const initialPincodeResult = await PincodeApplied(
+                browser,
+                dbPincode,
+                cronName,
+                homepage,
+                pincodeSelectors,
+                sendEvent
+            );
 
-        // Apply initial pincode
-        const initialPincodeResult = await PincodeApplied(
-            browser,
-            dbPincode,
-            cronName,
-            homepage,
-            pincodeSelectors,
-            sendEvent
-        );
-
-        if (initialPincodeResult.success) {
-            currentAppliedPincode = initialPincodeResult.pincode || dbPincode;
-            console.log('Initial pincode applied:', currentAppliedPincode);
-        } else {
-            console.log('Initial pincode was not applied:', initialPincodeResult.message);
+            if (initialPincodeResult && initialPincodeResult.success) {
+                currentAppliedPincode = initialPincodeResult.pincode || dbPincode;
+                console.log('Initial pincode applied:', currentAppliedPincode);
+            }
+        } catch (error) {
+            console.error('Pincode application error:', error.message);
         }
-
-        const scrapedData = [];
 
         /*
         ========================================================
-        PRODUCT LOOP - ONE PRODUCT PER BROWSER
+        OPTIMIZED NAVIGATION
         ========================================================
         */
 
-        for (
-            const product of ArrGetProductInfo
-        ) {
-
-
-            /*
-            ====================================================
-            CHECK CLIENT CONNECTION
-            ====================================================
-            */
-
-            if (clientDisconnected) {
-
-                console.log(
-                    'Client disconnected. Stopping stream.'
-                );
-
-                break;
-            }
-
-
-            const productUrl =
-                product.product_url;
-
-
-            const productId =
-                product[
-                    `${companyId}_product_id`
-                ];
-
-
-            const productCode =
-                product[
-                    `${companyId}_product_code`
-                ];
-
-
-            /*
-            ====================================================
-            URL VALIDATION
-            ====================================================
-            */
-
-            let hostname;
-
+        async function navigateToPage(page, url) {
             try {
-
-                hostname =
-                    new URL(productUrl).hostname;
-
-            } catch (error) {
-
-                console.error(
-                    'Invalid product URL:',
-                    productUrl
-                );
-
-                sendEvent('product_error', {
-
-                    productId,
-
-                    productCode,
-
-                    status: 'error',
-
-                    message:
-                        'Invalid product URL'
+                // Try with domcontentloaded first
+                await page.goto(url, {
+                    waitUntil: 'domcontentloaded',
+                    timeout: 15000
                 });
+                return true;
+            } catch (error) {
+                console.log('DOMContentLoaded timeout, trying load...');
+                
+                try {
+                    await page.goto(url, {
+                        waitUntil: 'load',
+                        timeout: 15000
+                    });
+                    return true;
+                } catch (error2) {
+                    console.log('Load timeout, trying networkidle0...');
+                    
+                    try {
+                        await page.goto(url, {
+                            waitUntil: 'networkidle0',
+                            timeout: 15000
+                        });
+                        return true;
+                    } catch (error3) {
+                        console.log('All navigation strategies failed');
+                        return false;
+                    }
+                }
+            }
+        }
 
-                continue;
+        /*
+        ========================================================
+        PROCESS SINGLE PRODUCT
+        ========================================================
+        */
+        
+        async function processSingleProduct(product) {
+            if (clientDisconnected || isShuttingDown) {
+                return;
             }
 
-
-            /*
-            ====================================================
-            AMAZON URL CHECK
-            ====================================================
-            */
+            const productUrl = product.product_url;
+            const productId = product[`${companyId}_product_id`];
+            const productCode = product[`${companyId}_product_code`];
+            
+            let hostname;
+            try {
+                hostname = new URL(productUrl).hostname;
+            } catch (error) {
+                console.error('Invalid product URL:', productUrl);
+                sendEvent('product_error', {
+                    productId,
+                    productCode,
+                    status: 'error',
+                    message: 'Invalid product URL'
+                });
+                failedScrapes++;
+                return;
+            }
 
             if (!hostname.includes('amazon')) {
-
                 sendEvent('product_error', {
-
                     productId,
-
                     productCode,
-
                     status: 'error',
-
-                    message:
-                        'Only Amazon URLs supported'
+                    message: 'Only Amazon URLs supported'
                 });
-
-                continue;
+                failedScrapes++;
+                return;
             }
 
-
-            /*
-            ====================================================
-            PRODUCT START
-            ====================================================
-            */
-
             productCount++;
-
-            const currentProductNumber =
-                productCount;
-
-
-            const currentProgress =
-                Math.round(
-                    (
-                        (
-                            currentProductNumber - 1
-                        ) /
-                        ScrapingProductCount
-                    ) * 100
-                );
-
+            const currentProductNumber = productCount;
+            const currentProgress = Math.round(((currentProductNumber - 1) / ScrapingProductCount) * 100);
 
             sendEvent('product_start', {
-
-                productNumber:
-                    currentProductNumber,
-
-                totalProducts:
-                    ScrapingProductCount,
-
-                progress:
-                    currentProgress,
-
+                productNumber: currentProductNumber,
+                totalProducts: ScrapingProductCount,
+                progress: currentProgress,
                 productId,
-
                 productCode,
-
                 productUrl,
-
                 status: 'running',
-
-                message:
-                    `Scraping product ${currentProductNumber} of ${ScrapingProductCount}`
+                message: `Scraping product ${currentProductNumber} of ${ScrapingProductCount}`
             });
 
-
-            let varProductPrice =
-                'No Result';
-
-            let varProductStock =
-                'No Result';
-
-            let varProductImage =
-                'No Result';
-
-            let varProductReview =
-                'No Result';
-
-            let varProductRating =
-                'No Result';
-
-            let scrapeStatus =
-                'pending';
-
+            let varProductPrice = 'No Result';
+            let varProductStock = 'No Result';
+            let varProductImage = 'No Result';
+            let varProductReview = 'No Result';
+            let varProductRating = 'No Result';
+            let scrapeStatus = 'pending';
             let modifiedDate;
 
-            // Create a new page for each product
             let page = null;
 
-            /*
-            ====================================================
-            PRODUCT SCRAPING
-            ====================================================
-            */
-
             try {
-
                 sendEvent('product_step', {
-
-                    productNumber:
-                        currentProductNumber,
-
+                    productNumber: currentProductNumber,
                     productId,
-
                     productCode,
-
                     step: 'page_loading',
-
                     status: 'running',
-
-                    message:
-                        'Opening Amazon product page...'
+                    message: 'Opening Amazon product page...'
                 });
 
-                // Create new page for this product
-                page = await browser.newPage();
+                page = await getPageFromPool();
 
-                // Set user agent for each page
-                await page.setUserAgent(
-                    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36'
-                );
-
-                // Set viewport
-                await page.setViewport({
-                    width: 1366,
-                    height: 768
-                });
-
-                // Check if it's amazon.in
-                if (hostname.includes('amazon.in')) {
-
-                    sendEvent('product_step', {
-
-                        productNumber:
-                            currentProductNumber,
-
-                        productId,
-
-                        productCode,
-
-                        step: 'pincode_check',
-
-                        status: 'running',
-
-                        message:
-                            `Checking pincode for amazon.in... Expected: ${dbPincode}, Current: ${currentAppliedPincode}`
-                    });
-
-                    // First navigate to the product page
-                    await page.goto(productUrl, {
-
-                        waitUntil: 'networkidle2',
-
-                        timeout: 50000
-                    });
-
-                    // Check if the current pincode on the website matches the database pincode
-                    // This can be done by checking the location display element
-                    const currentPincodeOnWebsite = await page.evaluate(() => {
-                        const locationElement = document.querySelector('#glow-ingress-line2');
-                        if (locationElement) {
-                            const text = locationElement.textContent.trim();
-                            // Extract pincode from text like "Delhi 110001"
-                            const match = text.match(/\d{6}/);
-                            return match ? match[0] : null;
-                        }
-                        return null;
-                    });
-
-                    console.log(`Current website pincode: ${currentPincodeOnWebsite}, Database pincode: ${dbPincode}`);
-
-                    // If pincode doesn't match or couldn't be retrieved, reapply it
-                    if (currentPincodeOnWebsite !== dbPincode) {
-                        sendEvent('product_step', {
-
-                            productNumber:
-                                currentProductNumber,
-
-                            productId,
-
-                            productCode,
-
-                            step: 'pincode_reapplying',
-
-                            status: 'running',
-
-                            message:
-                                `Pincode mismatch. Reapplying pincode ${dbPincode}...`
-                        });
-
-                        // Reapply pincode
-                        const pincodeResult = await PincodeApplied(
-                            browser,
-                            dbPincode,
-                            cronName,
-                            homepage,
-                            pincodeSelectors,
-                            sendEvent,
-                            page // Pass the current page
-                        );
-
-                        if (pincodeResult.success) {
-                            currentAppliedPincode = pincodeResult.pincode || dbPincode;
-                            console.log('Pincode reapplied successfully:', currentAppliedPincode);
-                            
-                            sendEvent('product_step', {
-
-                                productNumber:
-                                    currentProductNumber,
-
-                                productId,
-
-                                productCode,
-
-                                step: 'pincode_reapplied',
-
-                                status: 'completed',
-
-                                message:
-                                    `Pincode reapplied successfully: ${currentAppliedPincode}`
-                            });
-
-                            // Refresh the page after pincode change
-                            await page.reload({
-                                waitUntil: 'networkidle2',
-                                timeout: 50000
-                            });
-                        } else {
-                            console.log('Pincode reapplication failed:', pincodeResult.message);
-                            
-                            sendEvent('product_step', {
-
-                                productNumber:
-                                    currentProductNumber,
-
-                                productId,
-
-                                productCode,
-
-                                step: 'pincode_reapply_failed',
-
-                                status: 'warning',
-
-                                message:
-                                    `Pincode reapplication failed: ${pincodeResult.message}`
-                            });
-                        }
-                    } else {
-                        sendEvent('product_step', {
-
-                            productNumber:
-                                currentProductNumber,
-
-                            productId,
-
-                            productCode,
-
-                            step: 'pincode_match',
-
-                            status: 'completed',
-
-                            message:
-                                `Pincode matches: ${currentPincodeOnWebsite}`
-                        });
-                    }
-
-                } else {
-                    // For non-amazon.in sites, just navigate
-                    await page.goto(productUrl, {
-
-                        waitUntil: 'networkidle2',
-
-                        timeout: 50000
-                    });
+                const navigationSuccess = await navigateToPage(page, productUrl);
+                
+                if (!navigationSuccess) {
+                    throw new Error('Failed to load page after multiple attempts');
                 }
 
-
                 sendEvent('product_step', {
-
-                    productNumber:
-                        currentProductNumber,
-
+                    productNumber: currentProductNumber,
                     productId,
-
                     productCode,
-
-                    step:
-                        'page_loaded',
-
-                    status:
-                        'completed',
-
-                    message:
-                        'Amazon page loaded'
+                    step: 'page_loaded',
+                    status: 'completed',
+                    message: 'Page loaded successfully'
                 });
 
-
-                /*
-                =================================================
-                PRODUCT TITLE CHECK
-                =================================================
-                */
-
-                const productTitleExists =
-                    await page.$('#productTitle');
-
+                // Check if product title exists
+                const productTitleExists = await page.waitForSelector('#productTitle', { 
+                    timeout: 5000 
+                }).catch(() => null);
 
                 if (!productTitleExists) {
-
-                    varProductPrice =
-                        'No Result';
-
-                    varProductStock =
-                        'No Result';
-
-                    varProductImage =
-                        'No Result';
-
-                    varProductReview =
-                        'No Result';
-
-                    varProductRating =
-                        'No Result';
-
-                    scrapeStatus =
-                        'pending';
-
-
                     sendEvent('product_step', {
-
-                        productNumber:
-                            currentProductNumber,
-
+                        productNumber: currentProductNumber,
                         productId,
-
                         productCode,
-
-                        step:
-                            'product_title',
-
-                        status:
-                            'failed',
-
-                        message:
-                            'Product title not found'
+                        step: 'product_title',
+                        status: 'failed',
+                        message: 'Product title not found'
                     });
-
+                    failedScrapes++;
                 } else {
-
-
-                    /*
-                    =============================================
-                    EXTRACT PRODUCT DATA
-                    =============================================
-                    */
-
                     sendEvent('product_step', {
-
-                        productNumber:
-                            currentProductNumber,
-
+                        productNumber: currentProductNumber,
                         productId,
-
                         productCode,
-
-                        step:
-                            'extracting',
-
-                        status:
-                            'running',
-
-                        message:
-                            'Extracting product information...'
+                        step: 'extracting',
+                        status: 'running',
+                        message: 'Extracting product information...'
                     });
 
+                    const result = await page.evaluate(() => {
+                        const getText = (selector) => {
+                            const el = document.querySelector(selector);
+                            return el ? el.textContent.trim() : '';
+                        };
+                        const getAttr = (selector, attr) => {
+                            const el = document.querySelector(selector);
+                            return el ? el.getAttribute(attr) : '';
+                        };
 
-                    const result =
-                        await page.evaluate(() => {
-
-                            const getText = (selector) => {
-                                const el = document.querySelector(selector);
-                                return el ? el.textContent.trim() : '';
-                            };
-
-                            const getAttr = (selector, attr) => {
-                                const el = document.querySelector(selector);
-                                return el ? el.getAttribute(attr) : '';
-                            };
-
-                            // Try multiple price selectors
-                            let price = getText('#apex-pricetopay-accessibility-label');
-                            if (!price) {
-                                price = getText('#priceblock_ourprice');
+                        let price = getText('#apex-pricetopay-accessibility-label');
+                        if (!price) price = getText('#priceblock_ourprice');
+                        if (!price) price = getText('#priceblock_dealprice');
+                        if (!price) {
+                            price = getText('.a-price-whole');
+                            const fraction = document.querySelector('.a-price-fraction');
+                            if (price && fraction) {
+                                price = price + '.' + fraction.textContent.trim();
                             }
-                            if (!price) {
-                                price = getText('#priceblock_dealprice');
-                            }
-                            if (!price) {
-                                price = getText('.a-price-whole');
-                                const fraction = document.querySelector('.a-price-fraction');
-                                if (price && fraction) {
-                                    price = price + '.' + fraction.textContent.trim();
-                                }
-                            }
-
-                            return {
-                                price: price,
-                                image: getAttr('#landingImage', 'src'),
-                                review: getText('#acrCustomerReviewText') || 0,
-                                rating: getText('.mvt-cm-cr-review-stars-mini-popover span') || 0
-                            };
-                        });
-
-
-                    /*
-                    =============================================
-                    DEFAULT VALUES
-                    =============================================
-                    */
-
-                    varProductPrice =
-                        'No Result';
-
-                    varProductStock =
-                        'No Result';
-
-                    varProductImage =
-                        'No Result';
-
-                    varProductReview =
-                        'No Result';
-
-                    varProductRating =
-                        'No Result';
-
-                    scrapeStatus =
-                        'pending';
-
-
-                    /*
-                    =============================================
-                    RESULT FOUND
-                    =============================================
-                    */
-
-                    if (result !== null) {
-
-                        varProductImage =
-                            result.image ||
-                            'No Result';
-
-
-                        varProductReview =
-                            result.review
-                                ? parseFloat(result.review.replace(/[^0-9.]/g, '')) || 0
-                                : 'No Result';
-
-
-                        varProductRating =
-                            result.rating
-                                ? parseFloat(result.rating.replace(/[^0-9.]/g, '')) || 0
-                                : 'No Result';
-
-
-                        /*
-                        =========================================
-                        PROCESS PRICE
-                        =========================================
-                        */
-
-                        if (result.price) {
-
-                            const priceValue =
-                                result.price.match(/[\d,]+(?:\.\d+)?/)?.[0] || '';
-
-                            const newPrice =
-                                parseFloat(priceValue.replace(/,/g, ''));
-
-                            if (newPrice > 0) {
-
-                                varProductPrice = newPrice;
-
-                                varProductStock = 'In stock';
-
-                            } else {
-
-                                varProductStock = 'Out Of Stock';
-                            }
-
-                        } else {
-
-                            varProductStock = 'Out Of Stock';
                         }
 
-
-                        scrapeStatus =
-                            'completed';
-                    }
-
-
-                    sendEvent('product_step', {
-
-                        productNumber:
-                            currentProductNumber,
-
-                        productId,
-
-                        productCode,
-
-                        step:
-                            'extracting',
-
-                        status:
-                            scrapeStatus === 'completed'
-                                ? 'completed'
-                                : 'failed',
-
-                        message:
-                            scrapeStatus === 'completed'
-                                ? 'Product information extracted'
-                                : 'Product information not found'
+                        return {
+                            price: price,
+                            image: getAttr('#landingImage', 'src'),
+                            review: getText('#acrCustomerReviewText') || 0,
+                            rating: getText('.mvt-cm-cr-review-stars-mini-popover span') || 0
+                        };
                     });
+
+                    if (result !== null) {
+                        varProductImage = result.image || 'No Result';
+                        varProductReview = result.review ? parseFloat(result.review.replace(/[^0-9.]/g, '')) || 0 : 'No Result';
+                        varProductRating = result.rating ? parseFloat(result.rating.replace(/[^0-9.]/g, '')) || 0 : 'No Result';
+
+                        if (result.price) {
+                            const priceValue = result.price.match(/[\d,]+(?:\.\d+)?/)?.[0] || '';
+                            const newPrice = parseFloat(priceValue.replace(/,/g, ''));
+                            if (newPrice > 0) {
+                                varProductPrice = newPrice;
+                                varProductStock = 'In stock';
+                            } else {
+                                varProductStock = 'Out Of Stock';
+                            }
+                        } else {
+                            varProductStock = 'Out Of Stock';
+                        }
+                        scrapeStatus = 'completed';
+                        successfulScrapes++;
+                    } else {
+                        failedScrapes++;
+                    }
                 }
 
-
-                /*
-                =================================================
-                MODIFIED DATE
-                =================================================
-                */
-
-                modifiedDate =
-                    getCurrentIndTimeInfo(
-                        'India_Railway_Date_Time'
-                    );
-
-
-                /*
-                =================================================
-                PRICE CHANGE
-                =================================================
-                */
+                modifiedDate = getCurrentIndTimeInfo('India_Railway_Date_Time');
 
                 updatePriceChangeData(
-
                     scrapeStatus,
-
                     product.product_price,
-
                     varProductPrice,
-
                     productId,
-
                     productCode,
-
                     cronName,
-
                     cmpid,
-
                     companyId
                 );
 
-
-                sendEvent('product_step', {
-
-                    productNumber:
-                        currentProductNumber,
-
-                    productId,
-
-                    productCode,
-
-                    step:
-                        'database',
-
-                    status:
-                        'running',
-
-                    message:
-                        'Updating database...'
-                });
-
-
-                /*
-                =================================================
-                MONGO UPDATE
-                =================================================
-                */
-
-                await executeMongoUpdate(
-
-                    {
-                        collection:
-                            'ept_product_details_new_amazon',
-
-                        cmpid
-                    },
-
-                    {
-                        [`${companyId}_product_id`]:
-                            productId,
-
-                        [`${companyId}_product_code`]:
-                            productCode
-                    },
-
-                    {
-                        $set: {
-
-                            product_price:
-                                varProductPrice,
-
-                            product_stock:
-                                varProductStock,
-
-                            product_image:
-                                varProductImage,
-
-                            product_review:
-                                varProductReview,
-
-                            product_rating:
-                                varProductRating,
-
-                            modified_date:
-                                modifiedDate,
-
-                            product_scrape_status:
-                                scrapeStatus
-                        }
-                    }
-                );
-
-
-                /*
-                =================================================
-                PUSH RESULT
-                =================================================
-                */
-
-                const productResult = {
-
-                    product_ean_id:
-                        productId,
-
-                    product_code:
-                        productCode,
-
-                    product_price:
-                        varProductPrice,
-
-                    product_stock:
-                        varProductStock,
-
-                    modified_date:
-                        modifiedDate,
-
-                    scrape_status:
-                        scrapeStatus
-                };
-
-
-                scrapedData.push(
-                    productResult
-                );
-
-
-                /*
-                =================================================
-                PRODUCT COMPLETE
-                =================================================
-                */
-
-                const completedProgress =
-                    Math.round(
-                        (
-                            currentProductNumber /
-                            ScrapingProductCount
-                        ) * 100
-                    );
-
-
-                sendEvent('product_complete', {
-
-                    productNumber:
-                        currentProductNumber,
-
-                    totalProducts:
-                        ScrapingProductCount,
-
-                    processedProducts:
-                        currentProductNumber,
-
-                    progress:
-                        completedProgress,
-
-                    productId,
-
-                    productCode,
-
-                    status:
-                        scrapeStatus === 'completed'
-                            ? 'success'
-                            : 'pending',
-
-                    data:
-                        productResult,
-
-                    message:
-                        `Product ${currentProductNumber} completed`
-                });
-
-
-                /*
-                =================================================
-                UPDATE CRON PROGRESS
-                =================================================
-                */
-
-                if (!isSingleProduct) {
-
-                    await updateEndTimeInDb(
-
-                        currentProductNumber,
-
-                        'running',
-
-                        cmpid,
-
-                        companyId,
-
-                        null,
-
-                        cronName,
-
-                        cronStartTime,
-
-                        ScrapingProductCount
-                    );
-                }
-
-
-            } catch (error) {
-
-
-                /*
-                =================================================
-                PRODUCT ERROR
-                =================================================
-                */
-
-                console.error(
-                    `Error scraping product ${productId}`
-                );
-
-                console.error(error);
-
-
-                sendEvent('product_error', {
-
-                    productNumber:
-                        currentProductNumber,
-
-                    totalProducts:
-                        ScrapingProductCount,
-
-                    productId,
-
-                    productCode,
-
-                    progress:
-                        Math.round(
-                            (
-                                currentProductNumber /
-                                ScrapingProductCount
-                            ) * 100
-                        ),
-
-                    status:
-                        'error',
-
-                    message:
-                        error.message
-                        || 'Error scraping product'
-                });
-
-
-                /*
-                =================================================
-                UPDATE PRODUCT AS PENDING
-                =================================================
-                */
-
+                // Use safe MongoDB update with retry
                 try {
-
-                    await executeMongoUpdate(
-
+                    await safeMongoUpdate(
                         {
-                            collection:
-                                'ept_product_details_new_amazon',
-
+                            collection: 'ept_product_details_new_amazon',
                             cmpid
                         },
-
                         {
-                            [`${companyId}_product_id`]:
-                                productId,
-
-                            [`${companyId}_product_code`]:
-                                productCode
+                            [`${companyId}_product_id`]: productId,
+                            [`${companyId}_product_code`]: productCode
                         },
-
                         {
                             $set: {
-
-                                product_scrape_status:
-                                    'pending',
-
-                                modified_date:
-                                    getCurrentIndTimeInfo(
-                                        'India_Railway_Date_Time'
-                                    )
+                                product_price: varProductPrice,
+                                product_stock: varProductStock,
+                                product_image: varProductImage,
+                                product_review: varProductReview,
+                                product_rating: varProductRating,
+                                modified_date: modifiedDate,
+                                product_scrape_status: scrapeStatus
                             }
                         }
                     );
-
                 } catch (dbError) {
-
-                    console.error(
-                        'Database update error:',
-                        dbError
-                    );
+                    console.error('Database update error:', dbError.message);
+                    // Continue even if DB update fails
                 }
 
-            } finally {
+                const completedProgress = Math.round((currentProductNumber / ScrapingProductCount) * 100);
 
-                /*
-                =================================================
-                CLOSE PAGE AFTER EACH PRODUCT
-                =================================================
-                */
+                sendEvent('product_complete', {
+                    productNumber: currentProductNumber,
+                    totalProducts: ScrapingProductCount,
+                    processedProducts: currentProductNumber,
+                    progress: completedProgress,
+                    productId,
+                    productCode,
+                    status: scrapeStatus === 'completed' ? 'success' : 'pending',
+                    data: {
+                        product_ean_id: productId,
+                        product_code: productCode,
+                        product_price: varProductPrice,
+                        product_stock: varProductStock,
+                        modified_date: modifiedDate,
+                        scrape_status: scrapeStatus
+                    },
+                    message: `Product ${currentProductNumber} completed`
+                });
 
-                if (page) {
-
-                    console.log(
-                        `Closing page for product ${productId}...`
-                    );
-
+                if (!isSingleProduct) {
                     try {
-
-                        await page.close();
-
-                    } catch (error) {
-
-                        console.error(
-                            'Page close error:',
-                            error
+                        await updateEndTimeInDb(
+                            currentProductNumber,
+                            'running',
+                            cmpid,
+                            companyId,
+                            null,
+                            cronName,
+                            cronStartTime,
+                            ScrapingProductCount
                         );
+                    } catch (dbError) {
+                        console.error('Error updating end time:', dbError.message);
                     }
+                }
+
+            } catch (error) {
+                console.error(`Error scraping product ${productId}:`, error.message);
+                failedScrapes++;
+
+                sendEvent('product_error', {
+                    productNumber: currentProductNumber,
+                    totalProducts: ScrapingProductCount,
+                    productId,
+                    productCode,
+                    progress: Math.round((currentProductNumber / ScrapingProductCount) * 100),
+                    status: 'error',
+                    message: error.message || 'Error scraping product'
+                });
+
+                try {
+                    await safeMongoUpdate(
+                        {
+                            collection: 'ept_product_details_new_amazon',
+                            cmpid
+                        },
+                        {
+                            [`${companyId}_product_id`]: productId,
+                            [`${companyId}_product_code`]: productCode
+                        },
+                        {
+                            $set: {
+                                product_scrape_status: 'pending',
+                                modified_date: getCurrentIndTimeInfo('India_Railway_Date_Time')
+                            }
+                        }
+                    );
+                } catch (dbError) {
+                    console.error('Database update error:', dbError.message);
+                }
+            } finally {
+                if (page && !isShuttingDown) {
+                    returnPageToPool(page);
                 }
             }
 
-
-            /*
-            ====================================================
-            SMALL DELAY BETWEEN PRODUCTS
-            ====================================================
-            */
-
-            await delay(500);
-
-
+            await delay(CONFIG.DELAY_BETWEEN_PRODUCTS);
         }
 
+        /*
+        ========================================================
+        PROCESS PRODUCTS
+        ========================================================
+        */
+
+        // Process products one by one to avoid memory issues
+        for (let i = 0; i < ArrGetProductInfo.length; i++) {
+            if (clientDisconnected || isShuttingDown) {
+                console.log('Stopping due to disconnect or shutdown');
+                break;
+            }
+
+            await processSingleProduct(ArrGetProductInfo[i]);
+            
+            // Force garbage collection every 10 products
+            if (i % 10 === 0 && global.gc) {
+                global.gc();
+                console.log(`Garbage collected at product ${i + 1}`);
+            }
+        }
 
         /*
         ========================================================
@@ -1418,153 +823,58 @@ async function amazonScraper(req, res) {
         ========================================================
         */
 
-        const endTime =
-            new Date(
-                `${getCurrentIndTimeInfo(
-                    'India_Railway_Date_Only'
-                )}T${getCurrentIndTimeInfo(
-                    'India_Railway_Time'
-                )}`
-            );
-
-
-        const diffMs =
-            endTime - startTime;
-
-
-        const totalMins =
-            +(
-                diffMs / 60000
-            ).toFixed(2);
-
-
-        /*
-        ========================================================
-        UPDATE FINAL STATUS
-        ========================================================
-        */
+        const endTime = new Date(`${getCurrentIndTimeInfo('India_Railway_Date_Only')}T${getCurrentIndTimeInfo('India_Railway_Time')}`);
+        const diffMs = endTime - startTime;
+        const totalMins = +(diffMs / 60000).toFixed(2);
 
         if (!isSingleProduct) {
-
-            await updateEndTimeInDb(
-
-                productCount,
-
-                'ending',
-
-                cmpid,
-
-                companyId,
-
-                totalMins,
-
-                cronName,
-
-                cronStartTime,
-
-                ScrapingProductCount
-            );
+            try {
+                await updateEndTimeInDb(
+                    productCount,
+                    'ending',
+                    cmpid,
+                    companyId,
+                    totalMins,
+                    cronName,
+                    cronStartTime,
+                    ScrapingProductCount
+                );
+            } catch (error) {
+                console.error('Error updating final status:', error.message);
+            }
         }
 
-
-        /*
-        ========================================================
-        FINAL SSE RESPONSE
-        ========================================================
-        */
-
         sendEvent('complete', {
-
             status: true,
-
-            message:
-                'Scraping completed',
-
-            totalProducts:
-                ScrapingProductCount,
-
-            totalProcessed:
-                productCount,
-
+            message: 'Scraping completed',
+            totalProducts: ScrapingProductCount,
+            totalProcessed: productCount,
+            successfulScrapes: successfulScrapes,
+            failedScrapes: failedScrapes,
             progress: 100,
-
-            totalMinutes:
-                totalMins,
-
-            data:
-                scrapedData
+            totalMinutes: totalMins
         });
-
-
-        /*
-        ========================================================
-        CLOSE STREAM
-        ========================================================
-        */
 
         res.end();
 
-
     } catch (error) {
-
-
-        /*
-        ========================================================
-        MAIN ERROR
-        ========================================================
-        */
-
-        console.error(
-            'Amazon scraper error:',
-            error
-        );
-
+        console.error('Amazon scraper error:', error);
 
         if (!res.writableEnded) {
-
-            sendEvent('error', {
-
-                status: false,
-
-                message:
-                    error.message
-                    || 'Amazon scraping failed'
-            });
-
-            res.end();
-        }
-
-
-    } finally {
-
-
-        /*
-        ========================================================
-        CLOSE BROWSER
-        ========================================================
-        */
-
-        if (browser) {
-
-            console.log(
-                'Closing browser...'
-            );
-
             try {
-
-                await browser.close();
-
-            } catch (error) {
-
-                console.error(
-                    'Browser close error:',
-                    error
-                );
+                sendEvent('error', {
+                    status: false,
+                    message: error.message || 'Amazon scraping failed'
+                });
+                res.end();
+            } catch (e) {
+                console.error('Error sending error event:', e);
             }
         }
+    } finally {
+        await gracefulShutdown();
     }
 }
-
 
 module.exports = {
     amazonScraper
