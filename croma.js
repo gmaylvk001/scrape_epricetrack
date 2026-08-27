@@ -2,147 +2,338 @@ const puppeteer = require('puppeteer');
 const {
     getCurrentIndTimeInfo,
     updateStartTimeInDb,
-    updateEndTimeInDb
+    updateEndTimeInDb,
 } = require('./utils/cronTime');
-
 const { updatePriceChangeData } = require('./utils/priceChange');
-
+const { getStorePincode } = require('./utils/pinCode');
 const {
     executeMongoFind,
-    executeMongoCount,
-    executeMongoUpdate
+    executeMongoUpdate,
 } = require('./mongo');
 
 const cronName = 'croma';
 
-async function cromaScraper(req, res) {
+// ============================================================
+// HELPERS: MONGODB OPERATIONS WITH TRY-CATCH
+// ============================================================
 
-    const delay = (ms) =>
-        new Promise(resolve => setTimeout(resolve, ms));
+async function findDocuments(collectionName, cmpid, filter, projection = {}) {
+    try {
+        const docs = await executeMongoFind(
+            { collection: collectionName, cmpid },
+            filter,
+            projection
+        );
+        return docs || [];
+    } catch (error) {
+        console.error(`MongoDB find error in ${collectionName}:`, error.message);
+        return [];
+    }
+}
 
-    let browser;
+async function updateDocument(collectionName, cmpid, filter, updateData) {
+    try {
+        await executeMongoUpdate(
+            { collection: collectionName, cmpid },
+            filter,
+            updateData
+        );
+        return true;
+    } catch (error) {
+        console.error(`MongoDB update error in ${collectionName}:`, error.message);
+        return false;
+    }
+}
 
-    /*
-    ============================================================
-    SSE RESPONSE HELPERS
-    ============================================================
-    */
+// ============================================================
+// HELPER: SET PINCODE WITH SSE EVENTS
+// ============================================================
 
-    const sendEvent = (event, data) => {
-
-        if (res.writableEnded) {
-            return;
-        }
-
-        res.write(`event: ${event}\n`);
-        res.write(`data: ${JSON.stringify(data)}\n\n`);
-
-        // Make sure data is flushed
-        if (typeof res.flush === 'function') {
-            res.flush();
-        }
-    };
-
-
-    /*
-    ============================================================
-    REQUEST VALIDATION
-    ============================================================
-    */
-
-    const cmpid = req.query.cmpid;
-
-    if (!cmpid) {
-        return res.status(400).json({
-            status: false,
-            message: 'cmpid is required'
+async function ensurePincodeSet(page, pincode, reporter, context) {
+    // context: { productId, productCode, productNumber }
+    try {
+        reporter('pincode_detected', {
+            ...context,
+            status: 'running',
+            message: 'Pincode popup detected, setting pincode...',
         });
+
+        await page.waitForSelector('.pinElem', { visible: true, timeout: 10000 });
+        const input = await page.$('.pinElem');
+
+        // Clear existing value
+        await input.click({ clickCount: 3 });
+        await page.keyboard.down('Control');
+        await page.keyboard.press('A');
+        await page.keyboard.up('Control');
+        await page.keyboard.press('Backspace');
+
+        const code = pincode || '110001';
+
+        reporter('pincode_setting', {
+            ...context,
+            status: 'running',
+            message: `Entering pincode: ${code}`,
+        });
+
+        await input.type(code, { delay: 500 });
+
+        // Trigger events
+        await input.evaluate(el => {
+            el.dispatchEvent(new Event('input', { bubbles: true }));
+            el.dispatchEvent(new Event('change', { bubbles: true }));
+            el.dispatchEvent(new Event('blur', { bubbles: true }));
+        });
+
+        await page.click('#apply-pincode-btn');
+
+        // Wait until the dialog disappears
+        await page.waitForFunction(() => {
+            const dialog = document.querySelector('.MuiDialog-root');
+            return !dialog || getComputedStyle(dialog).display === 'none';
+        }, { timeout: 30000 });
+
+        await page.waitForNetworkIdle({ idleTime: 2000, timeout: 10000 });
+
+        reporter('pincode_success', {
+            ...context,
+            status: 'completed',
+            message: `Pincode set successfully to ${code}`,
+        });
+        console.log('Pincode set successfully.');
+    } catch (err) {
+        const errorMsg = err.message || 'Unknown error';
+        reporter('pincode_failed', {
+            ...context,
+            status: 'failed',
+            message: `Failed to set pincode: ${errorMsg}`,
+        });
+        console.warn('Failed to set pincode:', errorMsg);
+    }
+}
+
+// ============================================================
+// HELPER: SCRAPE A SINGLE PRODUCT
+// ============================================================
+
+async function scrapeSingleProduct(
+    browser,
+    product,
+    companyId,
+    pincode,
+    currentProductNumber,
+    totalProducts,
+    sendEvent
+) {
+    const productUrl = product.product_url;
+    const productId = product[`${companyId}_product_id`];
+    const productCode = product[`${companyId}_product_code`];
+    const context = { productId, productCode, productNumber: currentProductNumber };
+
+    // Validate URL
+    let hostname;
+    try {
+        hostname = new URL(productUrl).hostname;
+    } catch {
+        throw new Error('Invalid product URL');
+    }
+    if (!hostname.includes('croma')) {
+        throw new Error('Only Croma URLs supported');
     }
 
-    const companyId = cmpid.replace('plm_user_info_', '');
+    // Create a fresh page for this product
+    const productPage = await browser.newPage();
+    await productPage.setUserAgent(
+        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36'
+    );
 
+    let result = {
+        price: 'No Result',
+        stock: 'No Result',
+        image: 'No Result',
+        review: 'No Result',
+        rating: 'No Result',
+        scrapeStatus: 'pending',
+    };
+
+    try {
+        // Navigate to product page
+        await productPage.goto(productUrl, {
+            waitUntil: 'networkidle2',
+            timeout: 50000,
+        });
+
+        // Check for pincode popup (fast, non‑blocking)
+        const popupInput = await productPage.$('.MuiDialog-root .pinElem');
+        if (popupInput) {
+            await ensurePincodeSet(productPage, pincode, sendEvent, context);
+        }
+
+        // Check if product title exists
+        const titleExists = await productPage.$('.pd-title-normal');
+        if (!titleExists) {
+            // Product not found – keep defaults
+            return result;
+        }
+
+        // Wait for required selectors and extract data
+        await productPage.waitForSelector(
+            'script[type="application/ld+json"], [class*="pd-title-normal"], .pd-title-normal',
+            { timeout: 30000 }
+        );
+
+        const scraped = await productPage.evaluate(() => {
+            // Extract JSON-LD product data
+            const productData = [...document.querySelectorAll('script[type="application/ld+json"]')]
+                .map(script => {
+                    let text = script.textContent.trim();
+                    try {
+                        return JSON.parse(text);
+                    } catch {
+                        try {
+                            // Fix invalid escape sequences
+                            text = text.replace(/\\(?!["\\/bfnrtu])/g, "\\\\");
+                            text = text.replace(
+                                /"description"\s*:\s*"([\s\S]*?)",\s*"brand"/,
+                                (_, desc) => {
+                                    const fixedDesc = desc
+                                        .replace(/\r/g, "")
+                                        .replace(/\n/g, "\\n")
+                                        .replace(/"/g, '\\"');
+                                    return `"description":"${fixedDesc}","brand"`;
+                                }
+                            );
+                            while (true) {
+                                try {
+                                    return JSON.parse(text);
+                                } catch {
+                                    if (text.endsWith("}")) {
+                                        text = text.slice(0, -1).trim();
+                                    } else {
+                                        break;
+                                    }
+                                }
+                            }
+                        } catch {
+                            return null;
+                        }
+                    }
+                })
+                .find(item => item?.["@type"] === "Product");
+
+            const priceElement = document.querySelector('#pdp-product-price');
+            const price = priceElement?.textContent?.trim() || '';
+            const stockIndicator = document.querySelector('span.not-available-color') ||
+                                   document.querySelector('span.approvalStatus-span-message');
+            const availability = stockIndicator ? 'outofstock' : 'instock';
+
+            return {
+                price,
+                image: productData?.image?.[0] || '',
+                availability,
+                review: productData?.aggregateRating?.ratingCount || '0',
+                rating: productData?.aggregateRating?.ratingValue || '0',
+            };
+        });
+
+        // Process scraped data
+        if (scraped !== null) {
+            const availability = (scraped.availability || '').toLowerCase().trim();
+            const cleanedPrice = (scraped.price || '').replace(/[^0-9.]/g, '');
+
+            result.review = parseFloat(scraped.review) || 0;
+            result.rating = (Math.round(parseFloat(scraped.rating) * 10) / 10) || 0;
+            result.image = scraped.image || 'No Result';
+
+            if (availability === 'instock' && cleanedPrice > 0) {
+                result.price = parseFloat(cleanedPrice) || 'No Result';
+                result.stock = 'In stock';
+                result.scrapeStatus = 'completed';
+            } else if (availability.includes('outofstock') || availability.includes('currently unavailable')) {
+                result.stock = 'Out Of Stock';
+                result.scrapeStatus = 'completed';
+            } else {
+                result.scrapeStatus = 'pending';
+            }
+        }
+
+        return result;
+    } catch (error) {
+        console.error(`Error scraping product ${productId}:`, error.message);
+        throw error;
+    } finally {
+        await productPage.close();
+        console.log(`Product page for ${productId} closed.`);
+    }
+}
+
+// ============================================================
+// MAIN SCRAPER FUNCTION
+// ============================================================
+
+async function cromaScraper(req, res) {
+    const delay = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+    let browser;
+
+    // SSE helper
+    const sendEvent = (event, data) => {
+        if (res.writableEnded) return;
+        res.write(`event: ${event}\n`);
+        res.write(`data: ${JSON.stringify(data)}\n\n`);
+        if (typeof res.flush === 'function') res.flush();
+    };
+
+    // --------------------------------------------
+    // 1. Request validation
+    // --------------------------------------------
+    const cmpid = req.query.cmpid;
+    if (!cmpid) {
+        return res.status(400).json({ status: false, message: 'cmpid is required' });
+    }
+    const companyId = cmpid.replace('plm_user_info_', '');
     const ean = req.query.ean;
     const itemcode = req.query.itemcode;
-
     const isSingleProduct = !!(ean && itemcode);
 
-
-    /*
-    ============================================================
-    SSE HEADERS
-    ============================================================
-    */
-
+    // --------------------------------------------
+    // 2. Set up SSE headers
+    // --------------------------------------------
     res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
     res.setHeader('Cache-Control', 'no-cache, no-transform');
     res.setHeader('Connection', 'keep-alive');
-
-    // Important for nginx / reverse proxy buffering
     res.setHeader('X-Accel-Buffering', 'no');
-
-    // CORS
     res.setHeader('Access-Control-Allow-Origin', '*');
+    if (typeof res.flushHeaders === 'function') res.flushHeaders();
 
-    if (typeof res.flushHeaders === 'function') {
-        res.flushHeaders();
-    }
-
-
-    /*
-    ============================================================
-    CLIENT DISCONNECT HANDLING
-    ============================================================
-    */
-
+    // Client disconnect handling
     let clientDisconnected = false;
-
     req.on('close', () => {
-
         clientDisconnected = true;
-
-        console.log(
-            'Croma client disconnected'
-        );
+        console.log('Croma client disconnected');
     });
 
-
-    /*
-    ============================================================
-    INITIAL RESPONSE
-    ============================================================
-    */
-
+    // Initial event
     sendEvent('start', {
         status: true,
         message: 'Croma scraping started',
         cmpid,
         companyId,
-        isSingleProduct
+        isSingleProduct,
     });
 
-
     try {
-
-        /*
-        ========================================================
-        LAUNCH BROWSER
-        ========================================================
-        */
-
+        // --------------------------------------------
+        // 3. Launch browser
+        // --------------------------------------------
         sendEvent('step', {
             step: 'browser',
             status: 'running',
-            message: 'Launching browser...'
+            message: 'Launching browser...',
         });
 
-
         browser = await puppeteer.launch({
-
             headless: true,
-
-            executablePath:
-                process.env.PUPPETEER_EXECUTABLE_PATH || undefined,
-
+            executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || undefined,
             args: [
                 '--no-sandbox',
                 '--disable-setuid-sandbox',
@@ -153,1382 +344,309 @@ async function cromaScraper(req, res) {
                 '--disable-background-networking',
                 '--disable-background-timer-throttling',
                 '--disable-renderer-backgrounding',
-                '--disable-features=Translate,BackForwardCache'
+                '--disable-features=Translate,BackForwardCache',
             ],
-
-            timeout: 30000
+            timeout: 30000,
         });
 
+        const context = browser.defaultBrowserContext();
+        await context.overridePermissions('https://www.croma.com', []);
 
-        const page = await browser.newPage();
-
-
-        /*
-        ========================================================
-        USER AGENT
-        ========================================================
-        */
-
-        await page.setUserAgent(
-            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36'
-        );
-
-
-        /*
-        ========================================================
-        GET PRODUCTS
-        ========================================================
-        */
-
+        // --------------------------------------------
+        // 4. Fetch products from DB
+        // --------------------------------------------
         sendEvent('step', {
             step: 'products',
             status: 'running',
-            message: 'Fetching Croma products...'
+            message: 'Fetching Croma products...',
         });
 
-
         const filter = {
-
             status: 'active',
-
-            product_scrape_status: {
-                $in: ['pending', 'completed']
-            },
-
-            product_url: {
-                $nin: ['', null, 'No Result']
-            }
+            product_scrape_status: { $in: ['pending', 'completed'] },
+            product_url: { $nin: ['', null, 'No Result'] },
         };
-
-
-        /*
-        ========================================================
-        SINGLE PRODUCT FILTER
-        ========================================================
-        */
-
         if (isSingleProduct) {
-
             filter[`${companyId}_product_id`] = ean;
-
             filter[`${companyId}_product_code`] = itemcode;
         }
 
-
-        /*
-        ========================================================
-        GET CROMA PRODUCTS
-        ========================================================
-        */
-
-        const products = await executeMongoFind(
-
-            {
-                collection:
-                    'ept_product_details_new_croma',
-
-                cmpid
-            },
-
+        const products = await findDocuments(
+            'ept_product_details_new_croma',
+            cmpid,
             filter,
-
-            {
-                _id: 0
-            }
+            { _id: 0 }
         );
-
 
         if (!products || products.length === 0) {
-
             sendEvent('complete', {
-
                 status: true,
-
-                message:
-                    'Competitor products not found',
-
+                message: 'Competitor products not found',
                 totalProcessed: 0,
-
-                data: []
+                data: [],
             });
-
             res.end();
-
             return;
         }
 
-
-        /*
-        ========================================================
-        GET EXISTING PRODUCTS
-        ========================================================
-        */
-
-        const existingProducts = await executeMongoFind(
-
-            {
-                collection:
-                    'ept_product_details_new',
-
-                cmpid
-            },
-
+        // --------------------------------------------
+        // 5. Filter products that exist in our master list
+        // --------------------------------------------
+        const existingProducts = await findDocuments(
+            'ept_product_details_new',
+            cmpid,
             {
                 $and: [
-                    {
-                        status: 'active'
-                    },
-                    {
-                        ean_product_data_details_scrap_status: 'completed'
-                    }
-                ]
+                    { status: 'active' },
+                    { ean_product_data_details_scrap_status: 'completed' },
+                ],
             },
-
-            {
-                _id: 0,
-
-                product_ean_id: 1,
-
-                product_code: 1
-            }
+            { _id: 0, product_ean_id: 1, product_code: 1 }
         );
 
-
-        /*
-        ========================================================
-        CREATE PRODUCT MAP
-        ========================================================
-        */
-
         const productMap = new Set();
-
-
-        existingProducts.forEach((row) => {
-
-            const key =
-                `${row.product_ean_id}_${row.product_code}`;
-
-            productMap.add(key);
+        existingProducts.forEach(row => {
+            productMap.add(`${row.product_ean_id}_${row.product_code}`);
         });
 
-
-        /*
-        ========================================================
-        FILTER MATCHING PRODUCTS
-        ========================================================
-        */
-
-        const ArrGetProductInfo = [];
-
-
-        products.forEach((arrTmp) => {
-
-            const key =
-                `${arrTmp[`${companyId}_product_id`]}_${arrTmp[`${companyId}_product_code`]}`;
-
-
-            if (
-                productMap.has(key) &&
-                arrTmp['product_url'].includes('https://www.croma.com/')
-            ) {
-
-                ArrGetProductInfo.push(arrTmp);
+        const productsToScrape = [];
+        products.forEach(row => {
+            const key = `${row[`${companyId}_product_id`]}_${row[`${companyId}_product_code`]}`;
+            if (productMap.has(key) && row.product_url.includes('https://www.croma.com/')) {
+                productsToScrape.push(row);
             }
         });
 
-
-        if (ArrGetProductInfo.length === 0) {
-
+        if (productsToScrape.length === 0) {
             sendEvent('complete', {
-
                 status: true,
-
-                message:
-                    'Active products not found',
-
+                message: 'Active products not found',
                 totalProcessed: 0,
-
-                data: []
+                data: [],
             });
-
             res.end();
-
             return;
         }
 
+        const totalProducts = productsToScrape.length;
+        const startTime = new Date(
+            `${getCurrentIndTimeInfo('India_Railway_Date_Only')}T${getCurrentIndTimeInfo('India_Railway_Time')}`
+        );
+        const cronStartTime = getCurrentIndTimeInfo();
 
-        /*
-        ========================================================
-        SCRAPING INITIALIZATION
-        ========================================================
-        */
-
-        let productCount = 0;
-
-        const ScrapingProductCount =
-            ArrGetProductInfo.length;
-
-
-        const startTime =
-            new Date(
-                `${getCurrentIndTimeInfo(
-                    'India_Railway_Date_Only'
-                )}T${getCurrentIndTimeInfo(
-                    'India_Railway_Time'
-                )}`
-            );
-
-
-        const cronStartTime =
-            getCurrentIndTimeInfo();
-
-
-        /*
-        ========================================================
-        UPDATE START TIME
-        ========================================================
-        */
-
+        // Update start time in DB (only for full cron runs)
         if (!isSingleProduct) {
-
-            await updateStartTimeInDb(
-
-                cmpid,
-
-                companyId,
-
-                cronName,
-
-                ScrapingProductCount
-            );
+            await updateStartTimeInDb(cmpid, companyId, cronName, totalProducts);
         }
-
-
-        /*
-        ========================================================
-        SEND PRODUCT COUNT
-        ========================================================
-        */
 
         sendEvent('progress', {
-
             status: 'running',
-
-            totalProducts:
-                ScrapingProductCount,
-
+            totalProducts,
             processedProducts: 0,
-
             progress: 0,
-
-            message:
-                `${ScrapingProductCount} products found`
+            message: `${totalProducts} products found`,
         });
 
-
-        /*
-        ========================================================
-        SET PINCODE
-        ========================================================
-        */
-
-        const pincode = req.query.pincode;
-
-        sendEvent('step', {
-            step: 'pincode',
-            status: 'running',
-            message: `Setting pincode for Croma... pincode : ${pincode}`
-        });
-
-        try {
-
-            const productUrltest = "https://www.croma.com/";
-
-            await page.goto(productUrltest, {
-                waitUntil: 'networkidle2',
-                timeout: 50000
-            });
-
-            await delay(3000);
-
-            if (await page.$('.pinElem') === null) {
-
-                console.log('Croma pincode popup not found, continuing...');
-
-                sendEvent('step', {
-                    step: 'pincode',
-                    status: 'skipped',
-                    message: 'Pincode popup not found, continuing...'
-                });
-
-            } else {
-
-                await page.waitForSelector('.pinElem', {
-                    visible: true,
-                    timeout: 15000
-                });
-
-                const input = await page.$('.pinElem');
-
-                const existingPincode = await input.evaluate(el => el.value);
-
-                // Select existing pincode
-                await input.click({ clickCount: 3 });
-
-                await page.keyboard.down('Control');
-                await page.keyboard.press('A');
-                await page.keyboard.up('Control');
-
-                await page.keyboard.press('Backspace');
-
-                // Enter new pincode
-                if(pincode){
-                    await input.type(pincode, {
-                        delay: 100
-                    });
-                }
-                else{
-                    await input.type(existingPincode, {
-                        delay: 100
-                    });
-                }
-
-                // Trigger input events
-                await input.evaluate(el => {
-                    el.dispatchEvent(new Event('input', { bubbles: true }));
-                    el.dispatchEvent(new Event('change', { bubbles: true }));
-                    el.dispatchEvent(new Event('blur', { bubbles: true }));
-                });
-
-                await delay(1000);
-
-                const enteredPincode = await input.evaluate(el => el.value);
-
-                // Click Continue
-                await page.click('#apply-pincode-btn');
-
-                // Wait until popup is hidden
-                await page.waitForFunction(() => {
-                    const dialog = document.querySelector('.MuiDialog-root');
-
-                    if (!dialog) return true;
-
-                    return getComputedStyle(dialog).display === 'none';
-                }, {
-                    timeout: 30000
-                });
-
-                // Wait for page/network update
-                await page.waitForNetworkIdle({
-                    idleTime: 2000,
-                    timeout: 50000
-                });
-
-                await delay(2000);
-
-                sendEvent('step', {
-                    step: 'pincode',
-                    status: 'completed',
-                    message: `Pincode set successfully ${enteredPincode}`
-                });
-            }
-
-        } catch (err) {
-
-            console.log("Unable to set pincode:", err.message);
-
-            sendEvent('step', {
-                step: 'pincode',
-                status: 'failed',
-                message: `Unable to set pincode: ${err.message}`
-            });
+        // Get pincode from DB or fallback
+        let pincode = await getStorePincode(companyId);
+        if (pincode === null) {
+            pincode = req.query.pincode || '600018';
         }
 
-
         const scrapedData = [];
+        let productCount = 0;
 
-
-        /*
-        ========================================================
-        PRODUCT LOOP
-        ========================================================
-        */
-
-        for (
-            const product of ArrGetProductInfo
-        ) {
-
-
-            /*
-            ====================================================
-            CHECK CLIENT CONNECTION
-            ====================================================
-            */
-
+        // --------------------------------------------
+        // 6. Loop over each product
+        // --------------------------------------------
+        for (const product of productsToScrape) {
             if (clientDisconnected) {
-
-                console.log(
-                    'Client disconnected. Stopping stream.'
-                );
-
+                console.log('Client disconnected. Stopping stream.');
                 break;
             }
 
-
-            const productUrl =
-                product.product_url;
-
-
-            const productId =
-                product[
-                    `${companyId}_product_id`
-                ];
-
-
-            const productCode =
-                product[
-                    `${companyId}_product_code`
-                ];
-
-
-            /*
-            ====================================================
-            URL VALIDATION
-            ====================================================
-            */
-
-            let hostname;
-
-            try {
-
-                hostname =
-                    new URL(productUrl).hostname;
-
-            } catch (error) {
-
-                console.error(
-                    'Invalid product URL:',
-                    productUrl
-                );
-
-                sendEvent('product_error', {
-
-                    productId,
-
-                    productCode,
-
-                    status: 'error',
-
-                    message:
-                        'Invalid product URL'
-                });
-
-                continue;
-            }
-
-
-            /*
-            ====================================================
-            CROMA URL CHECK
-            ====================================================
-            */
-
-            if (!hostname.includes('croma')) {
-
-                sendEvent('product_error', {
-
-                    productId,
-
-                    productCode,
-
-                    status: 'error',
-
-                    message:
-                        'Only Croma URLs supported'
-                });
-
-                continue;
-            }
-
-
-            /*
-            ====================================================
-            PRODUCT START
-            ====================================================
-            */
-
             productCount++;
+            const currentNumber = productCount;
+            const progressBefore = Math.round(((currentNumber - 1) / totalProducts) * 100);
 
-            const currentProductNumber =
-                productCount;
-
-
-            const currentProgress =
-                Math.round(
-                    (
-                        (
-                            currentProductNumber - 1
-                        ) /
-                        ScrapingProductCount
-                    ) * 100
-                );
-
+            const productId = product[`${companyId}_product_id`];
+            const productCode = product[`${companyId}_product_code`];
 
             sendEvent('product_start', {
-
-                productNumber:
-                    currentProductNumber,
-
-                totalProducts:
-                    ScrapingProductCount,
-
-                progress:
-                    currentProgress,
-
+                productNumber: currentNumber,
+                totalProducts,
+                progress: progressBefore,
                 productId,
-
                 productCode,
-
-                productUrl,
-
+                productUrl: product.product_url,
                 status: 'running',
-
-                message:
-                    `Scraping product ${currentProductNumber} of ${ScrapingProductCount}`
+                message: `Scraping product ${currentNumber} of ${totalProducts}`,
             });
 
-
-            let varProductPrice =
-                'No Result';
-
-            let varProductStock =
-                'No Result';
-
-            let varProductImage =
-                'No Result';
-
-            let varProductReview =
-                'No Result';
-
-            let varProductRating =
-                'No Result';
-
-            let scrapeStatus =
-                'pending';
-
-            let modifiedDate;
-
-
-            /*
-            ====================================================
-            PRODUCT SCRAPING
-            ====================================================
-            */
-
+            let scrapeResult;
             try {
-
-                sendEvent('product_step', {
-
-                    productNumber:
-                        currentProductNumber,
-
-                    productId,
-
-                    productCode,
-
-                    step: 'page_loading',
-
-                    status: 'running',
-
-                    message:
-                        'Opening Croma product page...'
-                });
-
-
-                /*
-                =================================================
-                PAGE GOTO
-                =================================================
-                */
-
-                await page.goto(productUrl, {
-
-                    waitUntil:
-                        'networkidle2',
-
-                    timeout:
-                        50000
-                });
-
-
-                sendEvent('product_step', {
-
-                    productNumber:
-                        currentProductNumber,
-
-                    productId,
-
-                    productCode,
-
-                    step:
-                        'page_loaded',
-
-                    status:
-                        'completed',
-
-                    message:
-                        'Croma page loaded'
-                });
-
-
-                /*
-                =================================================
-                PRODUCT TITLE CHECK
-                =================================================
-                */
-
-                const productTitleExists =
-                    await page.$('.pd-title-normal');
-
-
-                if (!productTitleExists) {
-
-                    varProductPrice =
-                        'No Result';
-
-                    varProductStock =
-                        'No Result';
-
-                    varProductImage =
-                        'No Result';
-
-                    varProductReview =
-                        'No Result';
-
-                    varProductRating =
-                        'No Result';
-
-                    scrapeStatus =
-                        'pending';
-
-
-                    sendEvent('product_step', {
-
-                        productNumber:
-                            currentProductNumber,
-
-                        productId,
-
-                        productCode,
-
-                        step:
-                            'product_title',
-
-                        status:
-                            'failed',
-
-                        message:
-                            'Product title not found'
-                    });
-
-                } else {
-
-
-                    /*
-                    =============================================
-                    EXTRACT PRODUCT DATA
-                    =============================================
-                    */
-
-                    sendEvent('product_step', {
-
-                        productNumber:
-                            currentProductNumber,
-
-                        productId,
-
-                        productCode,
-
-                        step:
-                            'extracting',
-
-                        status:
-                            'running',
-
-                        message:
-                            'Extracting product information...'
-                    });
-
-
-                    await page.waitForSelector(
-                        'script[type="application/ld+json"], [class*="pd-title-normal"], .pd-title-normal',
-                        { timeout: 30000 }
-                    );
-
-
-                    const result = await page.evaluate(() => {
-
-                        const productData = [...document.querySelectorAll('script[type="application/ld+json"]')]
-                            .map(script => {
-                                let text = script.textContent.trim();
-                                try {
-                                    return JSON.parse(text);
-                                } catch (e) {
-                                    try {
-                                        // Fix invalid escape sequences
-                                        text = text.replace(/\\(?!["\\/bfnrtu])/g, "\\\\");
-                                        // Fix description field (raw newlines -> \n)
-                                        text = text.replace(
-                                            /"description"\s*:\s*"([\s\S]*?)",\s*"brand"/,
-                                            (_, desc) => {
-                                                const fixedDesc = desc
-                                                    .replace(/\r/g, "")
-                                                    .replace(/\n/g, "\\n")
-                                                    .replace(/"/g, '\\"');
-
-                                                return `"description":"${fixedDesc}","brand"`;
-                                            }
-                                        );
-                                        // Remove extra closing braces at the end (if any)
-                                        while (true) {
-                                            try {
-                                                return JSON.parse(text);
-                                            } catch {
-                                                if (text.endsWith("}")) {
-                                                    text = text.slice(0, -1).trim();
-                                                } else {
-                                                    break;
-                                                }
-                                            }
-                                        }
-                                    } catch (err) {
-                                        console.log("JSON-LD Parse Error:", err.message);
-                                    }
-                                    return null;
-                                }
-                            }).find(item => item?.["@type"] === "Product");
-
-                        const ProductPrice = document.querySelector('#pdp-product-price')?.textContent?.trim();
-                        const StockStatus = ((document.querySelector('span.not-available-color')) || (document.querySelector('span.approvalStatus-span-message'))) ? 'outofstock' : 'instock';
-
-                        return {
-                            price: ProductPrice || '',
-                            image: productData?.image?.[0] || '',
-                            availability: StockStatus,
-                            review: productData?.aggregateRating?.ratingCount || '0',
-                            rating: productData?.aggregateRating?.ratingValue || '0'
-                        };
-                    });
-
-
-                    /*
-                    =============================================
-                    DEFAULT VALUES
-                    =============================================
-                    */
-
-                    varProductPrice =
-                        'No Result';
-
-                    varProductStock =
-                        'No Result';
-
-                    varProductImage =
-                        'No Result';
-
-                    varProductReview =
-                        'No Result';
-
-                    varProductRating =
-                        'No Result';
-
-                    scrapeStatus =
-                        'pending';
-
-
-                    /*
-                    =============================================
-                    RESULT FOUND
-                    =============================================
-                    */
-
-                    if (result !== null) {
-
-                        const status =
-                            (result.availability || '')
-                                .toLowerCase()
-                                .trim();
-
-
-                        varProductReview =
-                            parseFloat(result.review) || 0;
-
-
-                        varProductRating =
-                            (Math.round(parseFloat(result.rating) * 10) / 10) || 0;
-
-
-                        varProductImage =
-                            result.image ||
-                            'No Result';
-
-
-                        const cleanedPrice =
-                            (result.price || '')
-                                .replace(/[^0-9.]/g, '');
-
-
-                        scrapeStatus =
-                            'completed';
-
-
-                        /*
-                        =========================================
-                        IN STOCK
-                        =========================================
-                        */
-
-                        if (
-                            (status === 'instock') &&
-                            (cleanedPrice > 0)
-                        ) {
-
-                            varProductPrice =
-                                parseFloat(cleanedPrice) ||
-                                'No Result';
-
-
-                            varProductStock =
-                                'In stock';
-
-                        }
-
-                        /*
-                        =========================================
-                        OUT OF STOCK
-                        =========================================
-                        */
-
-                        else if (
-
-                            status.includes(
-                                'outofstock'
-                            ) ||
-
-                            status.includes(
-                                'currently unavailable'
-                            )
-
-                        ) {
-
-                            varProductStock =
-                                'Out Of Stock';
-                        }
-                    }
-
-
-                    sendEvent('product_step', {
-
-                        productNumber:
-                            currentProductNumber,
-
-                        productId,
-
-                        productCode,
-
-                        step:
-                            'extracting',
-
-                        status:
-                            scrapeStatus === 'completed'
-                                ? 'completed'
-                                : 'failed',
-
-                        message:
-                            scrapeStatus === 'completed'
-                                ? 'Product information extracted'
-                                : 'Product information not found'
-                    });
-                }
-
-
-                /*
-                =================================================
-                MODIFIED DATE
-                =================================================
-                */
-
-                modifiedDate =
-                    getCurrentIndTimeInfo(
-                        'India_Railway_Date_Time'
-                    );
-
-
-                /*
-                =================================================
-                PRICE CHANGE
-                =================================================
-                */
-
-                updatePriceChangeData(
-
-                    scrapeStatus,
-
-                    product.product_price,
-
-                    varProductPrice,
-
-                    productId,
-
-                    productCode,
-
-                    cronName,
-
-                    cmpid,
-
-                    companyId
+                scrapeResult = await scrapeSingleProduct(
+                    browser,
+                    product,
+                    companyId,
+                    pincode,
+                    currentNumber,
+                    totalProducts,
+                    sendEvent  // pass the reporter
                 );
-
-
-                sendEvent('product_step', {
-
-                    productNumber:
-                        currentProductNumber,
-
-                    productId,
-
-                    productCode,
-
-                    step:
-                        'database',
-
-                    status:
-                        'running',
-
-                    message:
-                        'Updating database...'
-                });
-
-
-                /*
-                =================================================
-                MONGO UPDATE
-                =================================================
-                */
-
-                await executeMongoUpdate(
-
+            } catch (error) {
+                // Product scraping failed – mark as pending in DB
+                console.error(`Product ${productId} failed:`, error.message);
+                await updateDocument(
+                    'ept_product_details_new_croma',
+                    cmpid,
                     {
-                        collection:
-                            'ept_product_details_new_croma',
-
-                        cmpid
+                        [`${companyId}_product_id`]: productId,
+                        [`${companyId}_product_code`]: productCode,
                     },
-
-                    {
-                        [`${companyId}_product_id`]:
-                            productId,
-
-                        [`${companyId}_product_code`]:
-                            productCode
-                    },
-
                     {
                         $set: {
-
-                            product_price:
-                                varProductPrice,
-
-                            product_stock:
-                                varProductStock,
-
-                            product_image:
-                                varProductImage,
-
-                            product_review:
-                                varProductReview,
-
-                            product_rating:
-                                varProductRating,
-
-                            modified_date:
-                                modifiedDate,
-
-                            product_scrape_status:
-                                scrapeStatus
-                        }
+                            product_scrape_status: 'pending',
+                            modified_date: getCurrentIndTimeInfo('India_Railway_Date_Time'),
+                        },
                     }
                 );
-
-
-                /*
-                =================================================
-                PUSH RESULT
-                =================================================
-                */
-
-                const productResult = {
-
-                    product_ean_id:
-                        productId,
-
-                    product_code:
-                        productCode,
-
-                    product_price:
-                        varProductPrice,
-
-                    product_stock:
-                        varProductStock,
-
-                    modified_date:
-                        modifiedDate,
-
-                    scrape_status:
-                        scrapeStatus
-                };
-
-
-                scrapedData.push(
-                    productResult
-                );
-
-
-                /*
-                =================================================
-                PRODUCT COMPLETE
-                =================================================
-                */
-
-                const completedProgress =
-                    Math.round(
-                        (
-                            currentProductNumber /
-                            ScrapingProductCount
-                        ) * 100
-                    );
-
-
-                sendEvent('product_complete', {
-
-                    productNumber:
-                        currentProductNumber,
-
-                    totalProducts:
-                        ScrapingProductCount,
-
-                    processedProducts:
-                        currentProductNumber,
-
-                    progress:
-                        completedProgress,
-
-                    productId,
-
-                    productCode,
-
-                    status:
-                        scrapeStatus === 'completed'
-                            ? 'success'
-                            : 'pending',
-
-                    data:
-                        productResult,
-
-                    message:
-                        `Product ${currentProductNumber} completed`
-                });
-
-
-                /*
-                =================================================
-                UPDATE CRON PROGRESS
-                =================================================
-                */
-
-                if (!isSingleProduct) {
-
-                    await updateEndTimeInDb(
-
-                        currentProductNumber,
-
-                        'running',
-
-                        cmpid,
-
-                        companyId,
-
-                        null,
-
-                        cronName,
-
-                        cronStartTime,
-
-                        ScrapingProductCount
-                    );
-                }
-
-
-            } catch (error) {
-
-
-                /*
-                =================================================
-                PRODUCT ERROR
-                =================================================
-                */
-
-                console.error(
-                    `Error scraping product ${productId}`
-                );
-
-                console.error(error);
-
-
                 sendEvent('product_error', {
-
-                    productNumber:
-                        currentProductNumber,
-
-                    totalProducts:
-                        ScrapingProductCount,
-
+                    productNumber: currentNumber,
+                    totalProducts,
                     productId,
-
                     productCode,
-
-                    progress:
-                        Math.round(
-                            (
-                                currentProductNumber /
-                                ScrapingProductCount
-                            ) * 100
-                        ),
-
-                    status:
-                        'error',
-
-                    message:
-                        error.message
-                        || 'Error scraping product'
+                    progress: Math.round((currentNumber / totalProducts) * 100),
+                    status: 'error',
+                    message: error.message || 'Error scraping product',
                 });
-
-
-                /*
-                =================================================
-                UPDATE PRODUCT AS PENDING
-                =================================================
-                */
-
-                try {
-
-                    await executeMongoUpdate(
-
-                        {
-                            collection:
-                                'ept_product_details_new_croma',
-
-                            cmpid
-                        },
-
-                        {
-                            [`${companyId}_product_id`]:
-                                productId,
-
-                            [`${companyId}_product_code`]:
-                                productCode
-                        },
-
-                        {
-                            $set: {
-
-                                product_scrape_status:
-                                    'pending',
-
-                                modified_date:
-                                    getCurrentIndTimeInfo(
-                                        'India_Railway_Date_Time'
-                                    )
-                            }
-                        }
-                    );
-
-                } catch (dbError) {
-
-                    console.error(
-                        'Database update error:',
-                        dbError
-                    );
-                }
+                continue;
             }
 
-
-            /*
-            ====================================================
-            SMALL DELAY
-            ====================================================
-            */
-
-            await delay(100);
-
-
-        }
-
-
-        /*
-        ========================================================
-        FINAL CALCULATION
-        ========================================================
-        */
-
-        const endTime =
-            new Date(
-                `${getCurrentIndTimeInfo(
-                    'India_Railway_Date_Only'
-                )}T${getCurrentIndTimeInfo(
-                    'India_Railway_Time'
-                )}`
-            );
-
-
-        const diffMs =
-            endTime - startTime;
-
-
-        const totalMins =
-            +(
-                diffMs / 60000
-            ).toFixed(2);
-
-
-        /*
-        ========================================================
-        UPDATE FINAL STATUS
-        ========================================================
-        */
-
-        if (!isSingleProduct) {
-
-            await updateEndTimeInDb(
-
-                productCount,
-
-                'ending',
-
+            // Update scraped data in DB
+            const updateSuccess = await updateDocument(
+                'ept_product_details_new_croma',
                 cmpid,
-
-                companyId,
-
-                totalMins,
-
-                cronName,
-
-                cronStartTime,
-
-                ScrapingProductCount
+                {
+                    [`${companyId}_product_id`]: productId,
+                    [`${companyId}_product_code`]: productCode,
+                },
+                {
+                    $set: {
+                        product_price: scrapeResult.price,
+                        product_stock: scrapeResult.stock,
+                        product_image: scrapeResult.image,
+                        product_review: scrapeResult.review,
+                        product_rating: scrapeResult.rating,
+                        modified_date: getCurrentIndTimeInfo('India_Railway_Date_Time'),
+                        product_scrape_status: scrapeResult.scrapeStatus,
+                    },
+                }
             );
-        }
 
+            // Track price changes
+            updatePriceChangeData(
+                scrapeResult.scrapeStatus,
+                product.product_price,
+                scrapeResult.price,
+                productId,
+                productCode,
+                cronName,
+                cmpid,
+                companyId
+            );
 
-        /*
-        ========================================================
-        FINAL SSE RESPONSE
-        ========================================================
-        */
+            const productResult = {
+                product_ean_id: productId,
+                product_code: productCode,
+                product_price: scrapeResult.price,
+                product_stock: scrapeResult.stock,
+                modified_date: getCurrentIndTimeInfo('India_Railway_Date_Time'),
+                scrape_status: scrapeResult.scrapeStatus,
+            };
+            scrapedData.push(productResult);
 
-        sendEvent('complete', {
-
-            status: true,
-
-            message:
-                'Scraping completed',
-
-            totalProducts:
-                ScrapingProductCount,
-
-            totalProcessed:
-                productCount,
-
-            progress: 100,
-
-            totalMinutes:
-                totalMins,
-
-            data:
-                scrapedData
-        });
-
-
-        /*
-        ========================================================
-        CLOSE STREAM
-        ========================================================
-        */
-
-        res.end();
-
-
-    } catch (error) {
-
-
-        /*
-        ========================================================
-        MAIN ERROR
-        ========================================================
-        */
-
-        console.error(
-            'Croma scraper error:',
-            error
-        );
-
-
-        if (!res.writableEnded) {
-
-            sendEvent('error', {
-
-                status: false,
-
-                message:
-                    error.message
-                    || 'Croma scraping failed'
+            const progressAfter = Math.round((currentNumber / totalProducts) * 100);
+            sendEvent('product_complete', {
+                productNumber: currentNumber,
+                totalProducts,
+                processedProducts: currentNumber,
+                progress: progressAfter,
+                productId,
+                productCode,
+                status: scrapeResult.scrapeStatus === 'completed' ? 'success' : 'pending',
+                data: productResult,
+                message: `Product ${currentNumber} completed`,
             });
 
-            res.end();
+            // Update cron progress (for full runs)
+            if (!isSingleProduct) {
+                await updateEndTimeInDb(
+                    currentNumber,
+                    'running',
+                    cmpid,
+                    companyId,
+                    null,
+                    cronName,
+                    cronStartTime,
+                    totalProducts
+                );
+            }
+
+            await delay(100);
         }
 
+        // --------------------------------------------
+        // 7. Final summary
+        // --------------------------------------------
+        const endTime = new Date(
+            `${getCurrentIndTimeInfo('India_Railway_Date_Only')}T${getCurrentIndTimeInfo('India_Railway_Time')}`
+        );
+        const totalMinutes = +((endTime - startTime) / 60000).toFixed(2);
 
-    } finally {
-
-
-        /*
-        ========================================================
-        CLOSE BROWSER
-        ========================================================
-        */
-
-        if (browser) {
-
-            console.log(
-                'Closing browser...'
+        if (!isSingleProduct) {
+            await updateEndTimeInDb(
+                productCount,
+                'ending',
+                cmpid,
+                companyId,
+                totalMinutes,
+                cronName,
+                cronStartTime,
+                totalProducts
             );
+        }
 
+        sendEvent('complete', {
+            status: true,
+            message: 'Scraping completed',
+            totalProducts,
+            totalProcessed: productCount,
+            progress: 100,
+            totalMinutes,
+            data: scrapedData,
+        });
+
+        res.end();
+    } catch (error) {
+        console.error('Croma scraper error:', error);
+        if (!res.writableEnded) {
+            sendEvent('error', {
+                status: false,
+                message: error.message || 'Croma scraping failed',
+            });
+            res.end();
+        }
+    } finally {
+        if (browser) {
+            console.log('Closing browser...');
             try {
-
                 await browser.close();
-
             } catch (error) {
-
-                console.error(
-                    'Browser close error:',
-                    error
-                );
+                console.error('Browser close error:', error);
             }
         }
     }
 }
 
-
-module.exports = {
-    cromaScraper
-};
+module.exports = { cromaScraper };
