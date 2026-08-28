@@ -621,6 +621,7 @@ async function amazonScraper(req, res) {
                     });
 
                     const result = await page.evaluate(() => {
+
                         const getText = (selector) => {
                             const el = document.querySelector(selector);
                             return el ? el.textContent.trim() : '';
@@ -629,32 +630,33 @@ async function amazonScraper(req, res) {
                             const el = document.querySelector(selector);
                             return el ? el.getAttribute(attr) : '';
                         };
+                      
+                        const stockStatus = document.querySelectorAll(
+                            '.a-size-medium a-color-base primary-availability-message'
+                        ).length;
 
-                        let price = getText('#apex-pricetopay-accessibility-label');
-                        if (!price) price = getText('#priceblock_ourprice');
-                        if (!price) price = getText('#priceblock_dealprice');
-                        if (!price) {
-                            price = getText('.a-price-whole');
-                            const fraction = document.querySelector('.a-price-fraction');
-                            if (price && fraction) {
-                                price = price + '.' + fraction.textContent.trim();
-                            }
-                        }
-
+                        const offerPrice = document.querySelector(
+                            'span[class*="priceToPay"] span.a-price-whole'
+                        )?.textContent.trim() || '';
+                        
                         return {
-                            price: price,
+                            price: offerPrice,
+                            stock: stockStatus,
                             image: getAttr('#landingImage', 'src'),
                             review: getText('#acrCustomerReviewText') || 0,
                             rating: getText('.mvt-cm-cr-review-stars-mini-popover span') || 0
                         };
                     });
 
+                    console.log(result);
+
                     if (result !== null) {
+
                         varProductImage = result.image || 'No Result';
                         varProductReview = result.review ? parseFloat(result.review.replace(/[^0-9.]/g, '')) || 0 : 'No Result';
                         varProductRating = result.rating ? parseFloat(result.rating.replace(/[^0-9.]/g, '')) || 0 : 'No Result';
 
-                        if (result.price) {
+                        if (result.price && result.stock == 0) {
                             const priceValue = result.price.match(/[\d,]+(?:\.\d+)?/)?.[0] || '';
                             const newPrice = parseFloat(priceValue.replace(/,/g, ''));
                             if (newPrice > 0) {
