@@ -73,7 +73,7 @@ async function reliancedigitalScraper(req, res) {
         });
 
         browser = await puppeteer.launch({
-            headless: true,
+            headless: false,
             executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || undefined,
             args: [
                 '--no-sandbox',

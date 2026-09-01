@@ -17,13 +17,16 @@ const {
 
 const cronName = 'amazon';
 
-// Configuration constants
+// Enhanced Configuration constants
 const CONFIG = {
-    MAX_CONCURRENT_PAGES: 2, // Reduced to prevent memory issues
-    PAGE_TIMEOUT: 45000,
-    DELAY_BETWEEN_PRODUCTS: 500,
+    PAGE_TIMEOUT: 30000,
+    DELAY_BETWEEN_PRODUCTS: 300,
     MONGO_RETRY_DELAY: 2000,
     MAX_MONGO_RETRIES: 3,
+    MAX_PRODUCT_RETRIES: 3,
+    BROWSER_RESTART_AFTER: 80, // Restart browser after 80 products to prevent memory leaks
+    MAX_CONCURRENT_PAGES: 3,
+    MEMORY_THRESHOLD: 400 * 1024 * 1024, // 400MB
     BROWSER_ARGS: [
         '--no-sandbox',
         '--disable-setuid-sandbox',
@@ -35,7 +38,7 @@ const CONFIG = {
         '--disable-background-timer-throttling',
         '--disable-renderer-backgrounding',
         '--disable-features=Translate,BackForwardCache',
-        '--js-flags=--max-old-space-size=512',
+        '--js-flags=--max-old-space-size=2048',
         '--memory-pressure-off',
         '--disable-ipc-flooding-protection',
         '--disable-backgrounding-occluded-windows',
@@ -49,7 +52,13 @@ const CONFIG = {
         '--disable-translate',
         '--disable-web-security',
         '--disable-features=IsolateOrigins,site-per-process',
-        '--max_old_space_size=512'
+        '--max_old_space_size=2048',
+        '--disable-dev-shm-usage',
+        '--single-process', // Use single process to reduce memory
+        '--disable-accelerated-2d-canvas',
+        '--disable-accelerated-jpeg-decoding',
+        '--disable-accelerated-mjpeg-decode',
+        '--disable-accelerated-video-decode'
     ]
 };
 
@@ -59,8 +68,24 @@ async function amazonScraper(req, res) {
         new Promise(resolve => setTimeout(resolve, ms));
 
     let browser;
-    let pagePool = [];
     let isShuttingDown = false;
+    let productsProcessed = 0;
+    let browserRestartCount = 0;
+
+    // Memory monitoring
+    const memoryMonitor = setInterval(() => {
+        const used = process.memoryUsage();
+        const heapUsedMB = Math.round(used.heapUsed / 1024 / 1024);
+        const heapTotalMB = Math.round(used.heapTotal / 1024 / 1024);
+        console.log(`[Memory] Heap: ${heapUsedMB}MB / ${heapTotalMB}MB, RSS: ${Math.round(used.rss / 1024 / 1024)}MB`);
+        
+        if (used.heapUsed > CONFIG.MEMORY_THRESHOLD) {
+            console.log('⚠️ Memory threshold exceeded, forcing garbage collection');
+            if (global.gc) {
+                global.gc();
+            }
+        }
+    }, 30000);
 
     /*
     ============================================================
@@ -103,7 +128,6 @@ async function amazonScraper(req, res) {
                     throw error;
                 }
                 
-                // Wait before retry
                 await delay(CONFIG.MONGO_RETRY_DELAY * attempt);
             }
         }
@@ -127,30 +151,89 @@ async function amazonScraper(req, res) {
 
     /*
     ============================================================
-    PAGE POOL MANAGEMENT
+    BROWSER MANAGEMENT WITH RESTART
     ============================================================
     */
-    
-    const getPageFromPool = async () => {
-        while (pagePool.length > 0) {
-            const page = pagePool.pop();
+
+    const launchBrowser = async () => {
+        console.log(`🚀 Launching browser (Restart #${browserRestartCount})...`);
+        
+        const newBrowser = await puppeteer.launch({
+            headless: 'new', // Use new headless mode which is more memory efficient
+            executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || undefined,
+            args: CONFIG.BROWSER_ARGS,
+            timeout: 30000,
+            devtools: false,
+            ignoreDefaultArgs: [
+                '--enable-automation',
+                '--disable-web-security'
+            ],
+            defaultViewport: null
+        });
+
+        // Clear browser context for fresh start
+        const context = newBrowser.defaultBrowserContext();
+        await context.clearPermissionOverrides();
+        
+        return newBrowser;
+    };
+
+    const restartBrowser = async (applyPincode = true) => {
+        console.log('🔄 Restarting browser to free memory...');
+        browserRestartCount++;
+        
+        if (browser) {
             try {
-                await page.evaluate(() => 1);
-                return page;
+                await browser.close();
             } catch (error) {
-                try { await page.close(); } catch (e) {}
+                console.error('Error closing browser:', error);
             }
         }
         
+        browser = await launchBrowser();
+        
+        if (applyPincode && dbPincode) {
+            try {
+                await PincodeApplied(
+                    browser,
+                    dbPincode,
+                    cronName,
+                    homepage,
+                    pincodeSelectors,
+                    sendEvent
+                );
+            } catch (error) {
+                console.error('Error applying pincode after restart:', error);
+            }
+        }
+        
+        productsProcessed = 0;
+        
+        // Force garbage collection
+        if (global.gc) {
+            global.gc();
+        }
+        
+        console.log(`✅ Browser restarted successfully (Restart #${browserRestartCount})`);
+    };
+
+    /*
+    ============================================================
+    CREATE NEW PAGE WITH OPTIMIZED SETTINGS
+    ============================================================
+    */
+    
+    const createNewPage = async () => {
         const newPage = await browser.newPage();
         
-        // Optimize page settings
+        // Optimize page settings - LESS BLOCKING to avoid timeouts
         await newPage.setRequestInterception(true);
         
-        // Block unnecessary resources
+        // Block only heavy resources
         newPage.on('request', (req) => {
             const resourceType = req.resourceType();
-            if (['image', 'font', 'stylesheet', 'media'].includes(resourceType)) {
+            // Only block heavy resources, allow critical ones
+            if (['image', 'font', 'media'].includes(resourceType)) {
                 req.abort();
             } else {
                 req.continue();
@@ -158,7 +241,7 @@ async function amazonScraper(req, res) {
         });
         
         await newPage.setUserAgent(
-            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36'
+            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
         );
         
         await newPage.setViewport({
@@ -166,8 +249,13 @@ async function amazonScraper(req, res) {
             height: 768
         });
         
+        // Set shorter timeouts
+        newPage.setDefaultTimeout(CONFIG.PAGE_TIMEOUT);
+        newPage.setDefaultNavigationTimeout(CONFIG.PAGE_TIMEOUT);
+        
         // Disable unnecessary features
         await newPage.evaluateOnNewDocument(() => {
+            // Disable animations
             const style = document.createElement('style');
             style.textContent = `
                 * {
@@ -176,35 +264,35 @@ async function amazonScraper(req, res) {
                 }
             `;
             document.head.appendChild(style);
-            
-            // Prevent infinite scrolling
-            window.addEventListener('scroll', (e) => {
-                e.stopPropagation();
-            }, true);
         });
         
         return newPage;
     };
+
+    /*
+    ============================================================
+    CLOSE PAGE WITH CLEANUP
+    ============================================================
+    */
     
-    const returnPageToPool = (page) => {
-        if (page && !page.isClosed() && !isShuttingDown) {
+    const closePage = async (page) => {
+        if (page && !page.isClosed()) {
             try {
-                page.evaluate(() => {
-                    if (window.performance && window.performance.navigation) {
-                        window.performance.navigation.type = 2;
-                    }
-                    if (window._cf) delete window._cf;
-                    if (window._csrf) delete window._csrf;
-                }).catch(() => {});
+                // Clear all event listeners
+                page.removeAllListeners();
                 
-                page.goto('about:blank', { waitUntil: 'domcontentloaded' })
-                    .catch(() => {});
-            } catch (e) {}
-            
-            if (pagePool.length < CONFIG.MAX_CONCURRENT_PAGES) {
-                pagePool.push(page);
-            } else {
-                page.close().catch(() => {});
+                // Clear cookies
+                const cookies = await page.cookies();
+                if (cookies.length > 0) {
+                    await page.deleteCookie(...cookies);
+                }
+                
+                // Close page
+                await page.close({ runBeforeUnload: true });
+                
+                console.log('✅ Page closed and cleaned up');
+            } catch (error) {
+                console.error('Error closing page:', error.message);
             }
         }
     };
@@ -247,6 +335,7 @@ async function amazonScraper(req, res) {
     req.on('close', () => {
         clientDisconnected = true;
         console.log('Amazon client disconnected');
+        clearInterval(memoryMonitor);
     });
 
     /*
@@ -260,18 +349,7 @@ async function amazonScraper(req, res) {
         isShuttingDown = true;
         
         console.log('Starting graceful shutdown...');
-        
-        // Close all pages
-        while (pagePool.length > 0) {
-            const page = pagePool.pop();
-            try {
-                if (!page.isClosed()) {
-                    await page.close();
-                }
-            } catch (error) {
-                console.error('Page close error:', error);
-            }
-        }
+        clearInterval(memoryMonitor);
 
         if (browser) {
             console.log('Closing browser...');
@@ -292,6 +370,14 @@ async function amazonScraper(req, res) {
         pincode
     });
 
+    let dbPincode;
+    let homepage = "https://www.amazon.in/";
+    let pincodeSelectors = {
+        container: '#nav-global-location-data-modal-action',
+        inputfiled: '#GLUXZipUpdateInput',
+        applyfield: '#GLUXZipUpdate-announce'
+    };
+
     try {
         sendEvent('step', {
             step: 'browser',
@@ -299,18 +385,7 @@ async function amazonScraper(req, res) {
             message: 'Launching browser...'
         });
 
-        browser = await puppeteer.launch({
-            headless: true,
-            executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || undefined,
-            args: CONFIG.BROWSER_ARGS,
-            timeout: 30000,
-            devtools: false,
-            ignoreDefaultArgs: [
-                '--enable-automation',
-                '--disable-web-security'
-            ],
-            defaultViewport: null
-        });
+        browser = await launchBrowser();
 
         sendEvent('step', {
             step: 'products',
@@ -333,7 +408,6 @@ async function amazonScraper(req, res) {
             filter[`${companyId}_product_code`] = itemcode;
         }
 
-        // Use safe MongoDB operations with retry
         let products;
         try {
             products = await safeMongoFind(
@@ -380,7 +454,6 @@ async function amazonScraper(req, res) {
             );
         } catch (error) {
             console.error('Failed to fetch existing products:', error);
-            // Continue with empty existing products
             existingProducts = [];
         }
 
@@ -430,19 +503,10 @@ async function amazonScraper(req, res) {
             message: `${ScrapingProductCount} products found`
         });
 
-        let dbPincode = await getStorePincode(companyId);
+        dbPincode = await getStorePincode(companyId);
         if (dbPincode === null) {
             dbPincode = req.query.pincode || '600008';
         }
-
-        const homepage = "https://www.amazon.in/";
-        const pincodeSelectors = {
-            container: '#nav-global-location-data-modal-action',
-            inputfiled: '#GLUXZipUpdateInput',
-            applyfield: '#GLUXZipUpdate-announce'
-        };
-
-        let currentAppliedPincode = dbPincode;
 
         try {
             const initialPincodeResult = await PincodeApplied(
@@ -455,8 +519,8 @@ async function amazonScraper(req, res) {
             );
 
             if (initialPincodeResult && initialPincodeResult.success) {
-                currentAppliedPincode = initialPincodeResult.pincode || dbPincode;
-                console.log('Initial pincode applied:', currentAppliedPincode);
+                dbPincode = initialPincodeResult.pincode || dbPincode;
+                console.log('Initial pincode applied:', dbPincode);
             }
         } catch (error) {
             console.error('Pincode application error:', error.message);
@@ -464,51 +528,57 @@ async function amazonScraper(req, res) {
 
         /*
         ========================================================
-        OPTIMIZED NAVIGATION
+        OPTIMIZED NAVIGATION WITH RETRY
         ========================================================
         */
 
-        async function navigateToPage(page, url) {
-            try {
-                // Try with domcontentloaded first
-                await page.goto(url, {
-                    waitUntil: 'domcontentloaded',
-                    timeout: 15000
-                });
-                return true;
-            } catch (error) {
-                console.log('DOMContentLoaded timeout, trying load...');
-                
+        async function navigateToPage(page, url, retries = 3) {
+            for (let attempt = 1; attempt <= retries; attempt++) {
                 try {
+                    console.log(`🌐 Navigation attempt ${attempt} for ${url.substring(0, 50)}...`);
+                    
                     await page.goto(url, {
-                        waitUntil: 'load',
+                        waitUntil: 'domcontentloaded',
                         timeout: 15000
                     });
-                    return true;
-                } catch (error2) {
-                    console.log('Load timeout, trying networkidle0...');
                     
-                    try {
-                        await page.goto(url, {
-                            waitUntil: 'networkidle0',
-                            timeout: 15000
-                        });
+                    // Check if page loaded successfully
+                    const title = await page.title().catch(() => '');
+                    if (title && !title.includes('Robot') && !title.includes('Sorry')) {
+                        console.log(`✅ Page loaded successfully (attempt ${attempt})`);
                         return true;
-                    } catch (error3) {
-                        console.log('All navigation strategies failed');
+                    }
+                    
+                    throw new Error('Page loaded but appears to be blocked or empty');
+                    
+                } catch (error) {
+                    console.log(`Navigation attempt ${attempt} failed:`, error.message);
+                    
+                    if (attempt === retries) {
                         return false;
                     }
+                    
+                    // Exponential backoff
+                    const waitTime = Math.pow(2, attempt) * 2000;
+                    console.log(`Waiting ${waitTime}ms before retry...`);
+                    await delay(waitTime);
+                    
+                    // Refresh page state
+                    try {
+                        await page.reload({ timeout: 10000 });
+                    } catch (e) {}
                 }
             }
+            return false;
         }
 
         /*
         ========================================================
-        PROCESS SINGLE PRODUCT
+        PROCESS SINGLE PRODUCT WITH RETRY
         ========================================================
         */
         
-        async function processSingleProduct(product) {
+        async function processSingleProduct(product, retryCount = 0) {
             if (clientDisconnected || isShuttingDown) {
                 return;
             }
@@ -555,6 +625,7 @@ async function amazonScraper(req, res) {
                 productCode,
                 productUrl,
                 status: 'running',
+                retryCount: retryCount,
                 message: `Scraping product ${currentProductNumber} of ${ScrapingProductCount}`
             });
 
@@ -578,7 +649,8 @@ async function amazonScraper(req, res) {
                     message: 'Opening Amazon product page...'
                 });
 
-                page = await getPageFromPool();
+                // Create a new page for this product
+                page = await createNewPage();
 
                 const navigationSuccess = await navigateToPage(page, productUrl);
                 
@@ -600,7 +672,8 @@ async function amazonScraper(req, res) {
                     timeout: 5000 
                 }).catch(() => null);
 
-                if (!productTitleExists) {
+               if (!productTitleExists) {
+                
                     sendEvent('product_step', {
                         productNumber: currentProductNumber,
                         productId,
@@ -610,7 +683,9 @@ async function amazonScraper(req, res) {
                         message: 'Product title not found'
                     });
                     failedScrapes++;
+
                 } else {
+
                     sendEvent('product_step', {
                         productNumber: currentProductNumber,
                         productId,
@@ -620,6 +695,7 @@ async function amazonScraper(req, res) {
                         message: 'Extracting product information...'
                     });
 
+                    // Extract data with multiple selector strategies
                     const result = await page.evaluate(() => {
 
                         const getText = (selector) => {
@@ -648,8 +724,6 @@ async function amazonScraper(req, res) {
                         };
                     });
 
-                    console.log(result);
-
                     if (result !== null) {
 
                         varProductImage = result.image || 'No Result';
@@ -670,13 +744,16 @@ async function amazonScraper(req, res) {
                         }
                         scrapeStatus = 'completed';
                         successfulScrapes++;
+
                     } else {
                         failedScrapes++;
+                        throw new Error('Failed to extract product data');
                     }
                 }
 
                 modifiedDate = getCurrentIndTimeInfo('India_Railway_Date_Time');
 
+                // Update price change data
                 updatePriceChangeData(
                     scrapeStatus,
                     product.product_price,
@@ -688,7 +765,7 @@ async function amazonScraper(req, res) {
                     companyId
                 );
 
-                // Use safe MongoDB update with retry
+                // Update database
                 try {
                     await safeMongoUpdate(
                         {
@@ -707,13 +784,13 @@ async function amazonScraper(req, res) {
                                 product_review: varProductReview,
                                 product_rating: varProductRating,
                                 modified_date: modifiedDate,
-                                product_scrape_status: scrapeStatus
+                                product_scrape_status: scrapeStatus,
+                                last_scrape_attempt: getCurrentIndTimeInfo('India_Railway_Date_Time')
                             }
                         }
                     );
                 } catch (dbError) {
                     console.error('Database update error:', dbError.message);
-                    // Continue even if DB update fails
                 }
 
                 const completedProgress = Math.round((currentProductNumber / ScrapingProductCount) * 100);
@@ -756,6 +833,21 @@ async function amazonScraper(req, res) {
 
             } catch (error) {
                 console.error(`Error scraping product ${productId}:`, error.message);
+                
+                // Retry logic
+                if (retryCount < CONFIG.MAX_PRODUCT_RETRIES) {
+                    console.log(`🔄 Retrying product ${productId}, attempt ${retryCount + 1} of ${CONFIG.MAX_PRODUCT_RETRIES}`);
+                    await delay(5000 * (retryCount + 1)); // Increasing delay
+                    
+                    // Close current page if exists
+                    if (page) {
+                        await closePage(page);
+                    }
+                    
+                    // Recreate page for retry
+                    return await processSingleProduct(product, retryCount + 1);
+                }
+                
                 failedScrapes++;
 
                 sendEvent('product_error', {
@@ -781,7 +873,8 @@ async function amazonScraper(req, res) {
                         {
                             $set: {
                                 product_scrape_status: 'pending',
-                                modified_date: getCurrentIndTimeInfo('India_Railway_Date_Time')
+                                modified_date: getCurrentIndTimeInfo('India_Railway_Date_Time'),
+                                last_scrape_attempt: getCurrentIndTimeInfo('India_Railway_Date_Time')
                             }
                         }
                     );
@@ -789,8 +882,9 @@ async function amazonScraper(req, res) {
                     console.error('Database update error:', dbError.message);
                 }
             } finally {
-                if (page && !isShuttingDown) {
-                    returnPageToPool(page);
+                // Close the page after each product
+                if (page) {
+                    await closePage(page);
                 }
             }
 
@@ -799,23 +893,33 @@ async function amazonScraper(req, res) {
 
         /*
         ========================================================
-        PROCESS PRODUCTS
+        PROCESS PRODUCTS WITH BROWSER RESTART
         ========================================================
         */
 
-        // Process products one by one to avoid memory issues
         for (let i = 0; i < ArrGetProductInfo.length; i++) {
             if (clientDisconnected || isShuttingDown) {
                 console.log('Stopping due to disconnect or shutdown');
                 break;
             }
 
+            // Check if browser restart is needed
+            if (productsProcessed > 0 && productsProcessed % CONFIG.BROWSER_RESTART_AFTER === 0) {
+                console.log(`⚠️ Processed ${productsProcessed} products since last browser restart`);
+                await restartBrowser(true);
+            }
+
             await processSingleProduct(ArrGetProductInfo[i]);
+            productsProcessed++;
             
-            // Force garbage collection every 10 products
-            if (i % 10 === 0 && global.gc) {
+            // Force garbage collection every 5 products
+            if (i % 5 === 0 && global.gc) {
                 global.gc();
-                console.log(`Garbage collected at product ${i + 1}`);
+            }
+            
+            // Log progress every 50 products
+            if (i % 50 === 0 && i > 0) {
+                console.log(`📊 Progress: ${i + 1}/${ScrapingProductCount} products processed (${Math.round((i + 1) / ScrapingProductCount * 100)}%)`);
             }
         }
 
@@ -854,7 +958,8 @@ async function amazonScraper(req, res) {
             successfulScrapes: successfulScrapes,
             failedScrapes: failedScrapes,
             progress: 100,
-            totalMinutes: totalMins
+            totalMinutes: totalMins,
+            browserRestarts: browserRestartCount
         });
 
         res.end();
@@ -874,6 +979,7 @@ async function amazonScraper(req, res) {
             }
         }
     } finally {
+        clearInterval(memoryMonitor);
         await gracefulShutdown();
     }
 }

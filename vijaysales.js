@@ -7,6 +7,7 @@ const {
 
 const { updatePriceChangeData } = require('./utils/priceChange');
 const { getStorePincode } = require('./utils/pinCode');
+const { PincodeApplied } = require('./utils/pincodeApplied');
 
 const {
     executeMongoFind,
@@ -16,13 +17,16 @@ const {
 
 const cronName = 'vijaysales';
 
-// Configuration constants
+// Enhanced Configuration constants
 const CONFIG = {
-    MAX_CONCURRENT_PAGES: 2,
-    PAGE_TIMEOUT: 45000,
-    DELAY_BETWEEN_PRODUCTS: 500,
+    PAGE_TIMEOUT: 30000,
+    DELAY_BETWEEN_PRODUCTS: 300,
     MONGO_RETRY_DELAY: 2000,
     MAX_MONGO_RETRIES: 3,
+    MAX_PRODUCT_RETRIES: 3,
+    BROWSER_RESTART_AFTER: 80, // Restart browser after 80 products to prevent memory leaks
+    MAX_CONCURRENT_PAGES: 3,
+    MEMORY_THRESHOLD: 400 * 1024 * 1024, // 400MB
     BROWSER_ARGS: [
         '--no-sandbox',
         '--disable-setuid-sandbox',
@@ -34,7 +38,7 @@ const CONFIG = {
         '--disable-background-timer-throttling',
         '--disable-renderer-backgrounding',
         '--disable-features=Translate,BackForwardCache',
-        '--js-flags=--max-old-space-size=512',
+        '--js-flags=--max-old-space-size=2048',
         '--memory-pressure-off',
         '--disable-ipc-flooding-protection',
         '--disable-backgrounding-occluded-windows',
@@ -48,7 +52,13 @@ const CONFIG = {
         '--disable-translate',
         '--disable-web-security',
         '--disable-features=IsolateOrigins,site-per-process',
-        '--max_old_space_size=512'
+        '--max_old_space_size=2048',
+        '--disable-dev-shm-usage',
+        '--single-process', // Use single process to reduce memory
+        '--disable-accelerated-2d-canvas',
+        '--disable-accelerated-jpeg-decoding',
+        '--disable-accelerated-mjpeg-decode',
+        '--disable-accelerated-video-decode'
     ]
 };
 
@@ -58,8 +68,24 @@ async function vijaysalesScraper(req, res) {
         new Promise(resolve => setTimeout(resolve, ms));
 
     let browser;
-    let pagePool = [];
     let isShuttingDown = false;
+    let productsProcessed = 0;
+    let browserRestartCount = 0;
+
+    // Memory monitoring
+    const memoryMonitor = setInterval(() => {
+        const used = process.memoryUsage();
+        const heapUsedMB = Math.round(used.heapUsed / 1024 / 1024);
+        const heapTotalMB = Math.round(used.heapTotal / 1024 / 1024);
+        console.log(`[Memory] Heap: ${heapUsedMB}MB / ${heapTotalMB}MB, RSS: ${Math.round(used.rss / 1024 / 1024)}MB`);
+        
+        if (used.heapUsed > CONFIG.MEMORY_THRESHOLD) {
+            console.log('⚠️ Memory threshold exceeded, forcing garbage collection');
+            if (global.gc) {
+                global.gc();
+            }
+        }
+    }, 30000);
 
     /*
     ============================================================
@@ -125,30 +151,74 @@ async function vijaysalesScraper(req, res) {
 
     /*
     ============================================================
-    PAGE POOL MANAGEMENT
+    BROWSER MANAGEMENT WITH RESTART
     ============================================================
     */
-    
-    const getPageFromPool = async () => {
-        while (pagePool.length > 0) {
-            const page = pagePool.pop();
+
+    const launchBrowser = async () => {
+        console.log(`🚀 Launching browser (Restart #${browserRestartCount})...`);
+        
+        const newBrowser = await puppeteer.launch({
+            headless: 'new', // Use new headless mode which is more memory efficient
+            executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || undefined,
+            args: CONFIG.BROWSER_ARGS,
+            timeout: 30000,
+            devtools: false,
+            ignoreDefaultArgs: [
+                '--enable-automation',
+                '--disable-web-security'
+            ],
+            defaultViewport: null
+        });
+
+        // Clear browser context for fresh start
+        const context = newBrowser.defaultBrowserContext();
+        await context.clearPermissionOverrides();
+        
+        return newBrowser;
+    };
+
+    const restartBrowser = async (applyPincode = true) => {
+        console.log('🔄 Restarting browser to free memory...');
+        browserRestartCount++;
+        
+        if (browser) {
             try {
-                await page.evaluate(() => 1);
-                return page;
+                await browser.close();
             } catch (error) {
-                try { await page.close(); } catch (e) {}
+                console.error('Error closing browser:', error);
             }
         }
         
+        browser = await launchBrowser();
+        
+        productsProcessed = 0;
+        
+        // Force garbage collection
+        if (global.gc) {
+            global.gc();
+        }
+        
+        console.log(`✅ Browser restarted successfully (Restart #${browserRestartCount})`);
+    };
+
+    /*
+    ============================================================
+    CREATE NEW PAGE WITH OPTIMIZED SETTINGS
+    ============================================================
+    */
+    
+    const createNewPage = async () => {
         const newPage = await browser.newPage();
         
-        // Optimize page settings
+        // Optimize page settings - LESS BLOCKING to avoid timeouts
         await newPage.setRequestInterception(true);
         
-        // Block unnecessary resources
+        // Block only heavy resources
         newPage.on('request', (req) => {
             const resourceType = req.resourceType();
-            if (['image', 'font', 'stylesheet', 'media'].includes(resourceType)) {
+            // Only block heavy resources, allow critical ones
+            if (['image', 'font', 'media'].includes(resourceType)) {
                 req.abort();
             } else {
                 req.continue();
@@ -156,7 +226,7 @@ async function vijaysalesScraper(req, res) {
         });
         
         await newPage.setUserAgent(
-            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36'
+            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
         );
         
         await newPage.setViewport({
@@ -164,8 +234,13 @@ async function vijaysalesScraper(req, res) {
             height: 768
         });
         
+        // Set shorter timeouts
+        newPage.setDefaultTimeout(CONFIG.PAGE_TIMEOUT);
+        newPage.setDefaultNavigationTimeout(CONFIG.PAGE_TIMEOUT);
+        
         // Disable unnecessary features
         await newPage.evaluateOnNewDocument(() => {
+            // Disable animations
             const style = document.createElement('style');
             style.textContent = `
                 * {
@@ -174,68 +249,35 @@ async function vijaysalesScraper(req, res) {
                 }
             `;
             document.head.appendChild(style);
-            
-            // Prevent infinite scrolling
-            window.addEventListener('scroll', (e) => {
-                e.stopPropagation();
-            }, true);
         });
         
         return newPage;
     };
-    
-    const returnPageToPool = (page) => {
-        if (page && !page.isClosed() && !isShuttingDown) {
-            try {
-                page.evaluate(() => {
-                    if (window.performance && window.performance.navigation) {
-                        window.performance.navigation.type = 2;
-                    }
-                    if (window._cf) delete window._cf;
-                    if (window._csrf) delete window._csrf;
-                }).catch(() => {});
-                
-                page.goto('about:blank', { waitUntil: 'domcontentloaded' })
-                    .catch(() => {});
-            } catch (e) {}
-            
-            if (pagePool.length < CONFIG.MAX_CONCURRENT_PAGES) {
-                pagePool.push(page);
-            } else {
-                page.close().catch(() => {});
-            }
-        }
-    };
 
     /*
     ============================================================
-    GRACEFUL SHUTDOWN
+    CLOSE PAGE WITH CLEANUP
     ============================================================
     */
-
-    const gracefulShutdown = async () => {
-        if (isShuttingDown) return;
-        isShuttingDown = true;
-        
-        console.log('Starting graceful shutdown...');
-        
-        while (pagePool.length > 0) {
-            const page = pagePool.pop();
+    
+    const closePage = async (page) => {
+        if (page && !page.isClosed()) {
             try {
-                if (!page.isClosed()) {
-                    await page.close();
+                // Clear all event listeners
+                page.removeAllListeners();
+                
+                // Clear cookies
+                const cookies = await page.cookies();
+                if (cookies.length > 0) {
+                    await page.deleteCookie(...cookies);
                 }
+                
+                // Close page
+                await page.close({ runBeforeUnload: true });
+                
+                console.log('✅ Page closed and cleaned up');
             } catch (error) {
-                console.error('Page close error:', error);
-            }
-        }
-
-        if (browser) {
-            console.log('Closing browser...');
-            try {
-                await browser.close();
-            } catch (error) {
-                console.error('Browser close error:', error);
+                console.error('Error closing page:', error.message);
             }
         }
     };
@@ -259,14 +301,9 @@ async function vijaysalesScraper(req, res) {
 
     const ean = req.query.ean;
     const itemcode = req.query.itemcode;
+    const pincode = req.query.pincode || '110001';
 
     const isSingleProduct = !!(ean && itemcode);
-
-    /*
-    ============================================================
-    SSE HEADERS
-    ============================================================
-    */
 
     res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
     res.setHeader('Cache-Control', 'no-cache, no-transform');
@@ -278,69 +315,59 @@ async function vijaysalesScraper(req, res) {
         res.flushHeaders();
     }
 
-    /*
-    ============================================================
-    CLIENT DISCONNECT HANDLING
-    ============================================================
-    */
-
     let clientDisconnected = false;
 
     req.on('close', () => {
         clientDisconnected = true;
-        console.log('Vijay Sales client disconnected');
+        console.log('Vijaysales client disconnected');
+        clearInterval(memoryMonitor);
     });
 
     /*
     ============================================================
-    INITIAL RESPONSE
+    SAFE SHUTDOWN
     ============================================================
     */
 
+    const gracefulShutdown = async () => {
+        if (isShuttingDown) return;
+        isShuttingDown = true;
+        
+        console.log('Starting graceful shutdown...');
+        clearInterval(memoryMonitor);
+
+        if (browser) {
+            console.log('Closing browser...');
+            try {
+                await browser.close();
+            } catch (error) {
+                console.error('Browser close error:', error);
+            }
+        }
+    };
+
     sendEvent('start', {
         status: true,
-        message: 'Vijay Sales scraping started',
+        message: 'Vijaysales scraping started',
         cmpid,
         companyId,
-        isSingleProduct
+        isSingleProduct,
+        pincode
     });
 
     try {
-        /*
-        ========================================================
-        LAUNCH BROWSER
-        ========================================================
-        */
-
         sendEvent('step', {
             step: 'browser',
             status: 'running',
             message: 'Launching browser...'
         });
 
-        browser = await puppeteer.launch({
-            headless: true,
-            executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || undefined,
-            args: CONFIG.BROWSER_ARGS,
-            timeout: 30000,
-            devtools: false,
-            ignoreDefaultArgs: [
-                '--enable-automation',
-                '--disable-web-security'
-            ],
-            defaultViewport: null
-        });
-
-        /*
-        ========================================================
-        GET PRODUCTS
-        ========================================================
-        */
+        browser = await launchBrowser();
 
         sendEvent('step', {
             step: 'products',
             status: 'running',
-            message: 'Fetching Vijay Sales products...'
+            message: 'Fetching Vijaysales products...'
         });
 
         const filter = {
@@ -388,12 +415,6 @@ async function vijaysalesScraper(req, res) {
             return;
         }
 
-        /*
-        ========================================================
-        GET EXISTING PRODUCTS
-        ========================================================
-        */
-
         let existingProducts;
         try {
             existingProducts = await safeMongoFind(
@@ -401,10 +422,7 @@ async function vijaysalesScraper(req, res) {
                     collection: 'ept_product_details_new',
                     cmpid
                 },
-                {
-                    status: 'active',
-                    ean_product_data_details_scrap_status: 'completed'
-                },
+                { status: 'active' },
                 {
                     _id: 0,
                     product_ean_id: 1,
@@ -421,15 +439,11 @@ async function vijaysalesScraper(req, res) {
             productMap.add(`${row.product_ean_id}_${row.product_code}`);
         });
 
-        // Filter matching products - only vijaysales.com URLs
         const ArrGetProductInfo = products.filter((arrTmp) => {
             const key = `${arrTmp[`${companyId}_product_id`]}_${arrTmp[`${companyId}_product_code`]}`;
-            return productMap.has(key) && 
-                   arrTmp['product_url'] && 
-                   arrTmp['product_url'].includes('https://www.vijaysales.com/');
+            return productMap.has(key);
         });
 
-        // Clear arrays to free memory
         products.length = 0;
         existingProducts.length = 0;
 
@@ -443,19 +457,9 @@ async function vijaysalesScraper(req, res) {
             return;
         }
 
-        /*
-        ========================================================
-        SCRAPING INITIALIZATION
-        ========================================================
-        */
-
         let productCount = 0;
         let successfulScrapes = 0;
         let failedScrapes = 0;
-        let inStockCount = 0;
-        let outOfStockCount = 0;
-        let noResultCount = 0;
-
         const ScrapingProductCount = ArrGetProductInfo.length;
         const startTime = new Date(`${getCurrentIndTimeInfo('India_Railway_Date_Only')}T${getCurrentIndTimeInfo('India_Railway_Time')}`);
         const cronStartTime = getCurrentIndTimeInfo();
@@ -476,6 +480,7 @@ async function vijaysalesScraper(req, res) {
             message: `${ScrapingProductCount} products found`
         });
 
+
         /*
         ========================================================
         PINCODE SETUP
@@ -489,55 +494,60 @@ async function vijaysalesScraper(req, res) {
 
         console.log('Using pincode:', pincode);
 
+
         /*
         ========================================================
-        OPTIMIZED NAVIGATION
+        OPTIMIZED NAVIGATION WITH RETRY
         ========================================================
         */
 
-        async function navigateToPage(page, url) {
-            try {
-                // Strategy 1: Try with domcontentloaded first
-                await page.goto(url, {
-                    waitUntil: 'domcontentloaded',
-                    timeout: 15000
-                });
-                return true;
-            } catch (error) {
-                console.log('DOMContentLoaded timeout, trying load...');
-                
+        async function navigateToPage(page, url, retries = 3) {
+            for (let attempt = 1; attempt <= retries; attempt++) {
                 try {
-                    // Strategy 2: Try with load event
+                    console.log(`🌐 Navigation attempt ${attempt} for ${url.substring(0, 50)}...`);
+                    
                     await page.goto(url, {
-                        waitUntil: 'load',
+                        waitUntil: 'domcontentloaded',
                         timeout: 15000
                     });
-                    return true;
-                } catch (error2) {
-                    console.log('Load timeout, trying networkidle0...');
                     
-                    try {
-                        // Strategy 3: Try with networkidle0
-                        await page.goto(url, {
-                            waitUntil: 'networkidle0',
-                            timeout: 15000
-                        });
+                    // Check if page loaded successfully
+                    const title = await page.title().catch(() => '');
+                    if (title && !title.includes('Robot') && !title.includes('Sorry')) {
+                        console.log(`✅ Page loaded successfully (attempt ${attempt})`);
                         return true;
-                    } catch (error3) {
-                        console.log('All navigation strategies failed');
+                    }
+                    
+                    throw new Error('Page loaded but appears to be blocked or empty');
+                    
+                } catch (error) {
+                    console.log(`Navigation attempt ${attempt} failed:`, error.message);
+                    
+                    if (attempt === retries) {
                         return false;
                     }
+                    
+                    // Exponential backoff
+                    const waitTime = Math.pow(2, attempt) * 2000;
+                    console.log(`Waiting ${waitTime}ms before retry...`);
+                    await delay(waitTime);
+                    
+                    // Refresh page state
+                    try {
+                        await page.reload({ timeout: 10000 });
+                    } catch (e) {}
                 }
             }
+            return false;
         }
 
         /*
         ========================================================
-        PROCESS SINGLE PRODUCT
+        PROCESS SINGLE PRODUCT WITH RETRY
         ========================================================
         */
         
-        async function processSingleProduct(product) {
+        async function processSingleProduct(product, retryCount = 0) {
             if (clientDisconnected || isShuttingDown) {
                 return;
             }
@@ -545,7 +555,7 @@ async function vijaysalesScraper(req, res) {
             const productUrl = product.product_url;
             const productId = product[`${companyId}_product_id`];
             const productCode = product[`${companyId}_product_code`];
-
+            
             let hostname;
             try {
                 hostname = new URL(productUrl).hostname;
@@ -566,7 +576,7 @@ async function vijaysalesScraper(req, res) {
                     productId,
                     productCode,
                     status: 'error',
-                    message: 'Only Vijay Sales URLs supported'
+                    message: 'Only Vijaysales URLs supported'
                 });
                 failedScrapes++;
                 return;
@@ -584,6 +594,7 @@ async function vijaysalesScraper(req, res) {
                 productCode,
                 productUrl,
                 status: 'running',
+                retryCount: retryCount,
                 message: `Scraping product ${currentProductNumber} of ${ScrapingProductCount}`
             });
 
@@ -604,13 +615,12 @@ async function vijaysalesScraper(req, res) {
                     productCode,
                     step: 'page_loading',
                     status: 'running',
-                    message: 'Opening Vijay Sales product page...'
+                    message: 'Opening Vijaysales product page...'
                 });
 
-                // Get page from pool
-                page = await getPageFromPool();
+                // Create a new page for this product
+                page = await createNewPage();
 
-                // Use optimized navigation
                 const navigationSuccess = await navigateToPage(page, productUrl);
                 
                 if (!navigationSuccess) {
@@ -623,35 +633,27 @@ async function vijaysalesScraper(req, res) {
                     productCode,
                     step: 'page_loaded',
                     status: 'completed',
-                    message: 'Vijay Sales page loaded'
+                    message: 'Page loaded successfully'
                 });
 
-                /*
-                =================================================
-                PRODUCT PAGE CHECK
-                =================================================
-                */
-
-                const productPageExists = await page.waitForSelector('.product', { 
+                // Check if product title exists
+                const productTitleExists = await page.waitForSelector('h1.productFullDetail__productName', { 
                     timeout: 5000 
                 }).catch(() => null);
 
-                if (!productPageExists) {
+               if (!productTitleExists) {
+                
                     sendEvent('product_step', {
                         productNumber: currentProductNumber,
                         productId,
                         productCode,
-                        step: 'product_page',
+                        step: 'product_title',
                         status: 'failed',
-                        message: 'Product page not found'
+                        message: 'Product title not found'
                     });
                     failedScrapes++;
+
                 } else {
-                    /*
-                    =============================================
-                    EXTRACT PRODUCT DATA
-                    =============================================
-                    */
 
                     sendEvent('product_step', {
                         productNumber: currentProductNumber,
@@ -662,6 +664,7 @@ async function vijaysalesScraper(req, res) {
                         message: 'Extracting product information...'
                     });
 
+                    // Extract data with multiple selector strategies
                     const result = await page.evaluate(async ({ productUrl, pincode }) => {
 
                         const getText = (selector) => {
@@ -735,6 +738,7 @@ async function vijaysalesScraper(req, res) {
                     });
 
                     if (result !== null) {
+
                         const status = (result.availability || '').toLowerCase().trim();
 
                         varProductImage = result.image || 'No Result';
@@ -745,47 +749,24 @@ async function vijaysalesScraper(req, res) {
                             const cleanedPrice = (result.price || '').replace(/[^0-9.]/g, '');
                             varProductPrice = parseFloat(cleanedPrice) || 'No Result';
                             varProductStock = 'In stock';
-                            inStockCount++;
                         } else if (status.includes('outofstock') || status.includes('currently unavailable')) {
                             varProductStock = 'Out Of Stock';
-                            outOfStockCount++;
                         } else {
                             varProductStock = 'No Result';
-                            noResultCount++;
                         }
 
                         scrapeStatus = 'completed';
                         successfulScrapes++;
+
                     } else {
                         failedScrapes++;
+                        throw new Error('Failed to extract product data');
                     }
-
-                    sendEvent('product_step', {
-                        productNumber: currentProductNumber,
-                        productId,
-                        productCode,
-                        step: 'extracting',
-                        status: scrapeStatus === 'completed' ? 'completed' : 'failed',
-                        message: scrapeStatus === 'completed' 
-                            ? 'Product information extracted' 
-                            : 'Product information not found'
-                    });
                 }
-
-                /*
-                =================================================
-                MODIFIED DATE
-                =================================================
-                */
 
                 modifiedDate = getCurrentIndTimeInfo('India_Railway_Date_Time');
 
-                /*
-                =================================================
-                PRICE CHANGE
-                =================================================
-                */
-
+                // Update price change data
                 updatePriceChangeData(
                     scrapeStatus,
                     product.product_price,
@@ -797,21 +778,7 @@ async function vijaysalesScraper(req, res) {
                     companyId
                 );
 
-                sendEvent('product_step', {
-                    productNumber: currentProductNumber,
-                    productId,
-                    productCode,
-                    step: 'database',
-                    status: 'running',
-                    message: 'Updating database...'
-                });
-
-                /*
-                =================================================
-                MONGO UPDATE
-                =================================================
-                */
-
+                // Update database
                 try {
                     await safeMongoUpdate(
                         {
@@ -830,19 +797,14 @@ async function vijaysalesScraper(req, res) {
                                 product_review: varProductReview,
                                 product_rating: varProductRating,
                                 modified_date: modifiedDate,
-                                product_scrape_status: scrapeStatus
+                                product_scrape_status: scrapeStatus,
+                                last_scrape_attempt: getCurrentIndTimeInfo('India_Railway_Date_Time')
                             }
                         }
                     );
                 } catch (dbError) {
                     console.error('Database update error:', dbError.message);
                 }
-
-                /*
-                =================================================
-                PRODUCT COMPLETE
-                =================================================
-                */
 
                 const completedProgress = Math.round((currentProductNumber / ScrapingProductCount) * 100);
 
@@ -865,12 +827,6 @@ async function vijaysalesScraper(req, res) {
                     message: `Product ${currentProductNumber} completed`
                 });
 
-                /*
-                =================================================
-                UPDATE CRON PROGRESS
-                =================================================
-                */
-
                 if (!isSingleProduct) {
                     try {
                         await updateEndTimeInDb(
@@ -883,13 +839,28 @@ async function vijaysalesScraper(req, res) {
                             cronStartTime,
                             ScrapingProductCount
                         );
-                    } catch (error) {
-                        console.error('Error updating end time:', error.message);
+                    } catch (dbError) {
+                        console.error('Error updating end time:', dbError.message);
                     }
                 }
 
             } catch (error) {
                 console.error(`Error scraping product ${productId}:`, error.message);
+                
+                // Retry logic
+                if (retryCount < CONFIG.MAX_PRODUCT_RETRIES) {
+                    console.log(`🔄 Retrying product ${productId}, attempt ${retryCount + 1} of ${CONFIG.MAX_PRODUCT_RETRIES}`);
+                    await delay(5000 * (retryCount + 1)); // Increasing delay
+                    
+                    // Close current page if exists
+                    if (page) {
+                        await closePage(page);
+                    }
+                    
+                    // Recreate page for retry
+                    return await processSingleProduct(product, retryCount + 1);
+                }
+                
                 failedScrapes++;
 
                 sendEvent('product_error', {
@@ -915,7 +886,8 @@ async function vijaysalesScraper(req, res) {
                         {
                             $set: {
                                 product_scrape_status: 'pending',
-                                modified_date: getCurrentIndTimeInfo('India_Railway_Date_Time')
+                                modified_date: getCurrentIndTimeInfo('India_Railway_Date_Time'),
+                                last_scrape_attempt: getCurrentIndTimeInfo('India_Railway_Date_Time')
                             }
                         }
                     );
@@ -923,8 +895,9 @@ async function vijaysalesScraper(req, res) {
                     console.error('Database update error:', dbError.message);
                 }
             } finally {
-                if (page && !isShuttingDown) {
-                    returnPageToPool(page);
+                // Close the page after each product
+                if (page) {
+                    await closePage(page);
                 }
             }
 
@@ -933,7 +906,7 @@ async function vijaysalesScraper(req, res) {
 
         /*
         ========================================================
-        PROCESS PRODUCTS
+        PROCESS PRODUCTS WITH BROWSER RESTART
         ========================================================
         */
 
@@ -943,12 +916,23 @@ async function vijaysalesScraper(req, res) {
                 break;
             }
 
+            // Check if browser restart is needed
+            if (productsProcessed > 0 && productsProcessed % CONFIG.BROWSER_RESTART_AFTER === 0) {
+                console.log(`⚠️ Processed ${productsProcessed} products since last browser restart`);
+                await restartBrowser(true);
+            }
+
             await processSingleProduct(ArrGetProductInfo[i]);
+            productsProcessed++;
             
-            // Force garbage collection every 10 products
-            if (i % 10 === 0 && global.gc) {
+            // Force garbage collection every 5 products
+            if (i % 5 === 0 && global.gc) {
                 global.gc();
-                console.log(`Garbage collected at product ${i + 1}`);
+            }
+            
+            // Log progress every 50 products
+            if (i % 50 === 0 && i > 0) {
+                console.log(`📊 Progress: ${i + 1}/${ScrapingProductCount} products processed (${Math.round((i + 1) / ScrapingProductCount * 100)}%)`);
             }
         }
 
@@ -979,12 +963,6 @@ async function vijaysalesScraper(req, res) {
             }
         }
 
-        /*
-        ========================================================
-        FINAL SSE RESPONSE - Without scrapedData
-        ========================================================
-        */
-
         sendEvent('complete', {
             status: true,
             message: 'Scraping completed',
@@ -994,31 +972,27 @@ async function vijaysalesScraper(req, res) {
             failedScrapes: failedScrapes,
             progress: 100,
             totalMinutes: totalMins,
-            summary: {
-                inStockCount: inStockCount,
-                outOfStockCount: outOfStockCount,
-                noResultCount: noResultCount
-            }
+            browserRestarts: browserRestartCount
         });
 
         res.end();
 
     } catch (error) {
-        console.error('Vijay Sales scraper error:', error);
+        console.error('Vijaysales scraper error:', error);
 
         if (!res.writableEnded) {
             try {
                 sendEvent('error', {
                     status: false,
-                    message: error.message || 'Vijay Sales scraping failed'
+                    message: error.message || 'Vijaysales scraping failed'
                 });
                 res.end();
             } catch (e) {
                 console.error('Error sending error event:', e);
             }
         }
-
     } finally {
+        clearInterval(memoryMonitor);
         await gracefulShutdown();
     }
 }
