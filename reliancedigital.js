@@ -73,21 +73,16 @@ async function reliancedigitalScraper(req, res) {
         });
 
         browser = await puppeteer.launch({
-            headless: false,
+            headless: 'new', // Use new headless mode which is more memory efficient
             executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || undefined,
-            args: [
-                '--no-sandbox',
-                '--disable-setuid-sandbox',
-                '--disable-dev-shm-usage',
-                '--disable-gpu',
-                '--disable-software-rasterizer',
-                '--disable-extensions',
-                '--disable-background-networking',
-                '--disable-background-timer-throttling',
-                '--disable-renderer-backgrounding',
-                '--disable-features=Translate,BackForwardCache'
+            args: CONFIG.BROWSER_ARGS,
+            timeout: 30000,
+            devtools: false,
+            ignoreDefaultArgs: [
+                '--enable-automation',
+                '--disable-web-security'
             ],
-            timeout: 30000
+            defaultViewport: null
         });
 
         // ── Fetch products ──────────────────────────────────────
