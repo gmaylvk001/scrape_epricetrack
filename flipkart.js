@@ -73,7 +73,7 @@ async function flipkartScraper(req, res) {
         });
 
         browser = await puppeteer.launch({
-            headless: true,
+            headless: "new",
             executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || undefined,
             args: [
                 '--no-sandbox',
@@ -585,339 +585,76 @@ async function flipkartScraper(req, res) {
     }
 }
 
-// async function setGlobalPincode(browser, pincode, sendEvent) {
-//     const page = await browser.newPage();
-
-//     // ── Helper delay ──────────────────────────────────────────
-//     const delay = (ms) => new Promise(resolve => setTimeout(resolve, ms));
-
-//     // ── Step: Clear cookies & cache ──────────────────────────
-//     if (sendEvent) {
-//         sendEvent('step', {
-//             step: 'pincode_clear',
-//             status: 'running',
-//             message: 'Clearing browser cookies and cache...'
-//         });
-//     }
-//     const client = await page.target().createCDPSession();
-//     await client.send('Network.clearBrowserCookies');
-//     await client.send('Network.clearBrowserCache');
-//     console.log('Cleared cookies and cache.');
-//     if (sendEvent) {
-//         sendEvent('step', {
-//             step: 'pincode_clear',
-//             status: 'completed',
-//             message: 'Cookies and cache cleared.'
-//         });
-//     }
-
-//     // ── Step: Block heavy resources ──────────────────────────
-//     if (sendEvent) {
-//         sendEvent('step', {
-//             step: 'pincode_block',
-//             status: 'running',
-//             message: 'Blocking non-essential resources (images, styles, fonts)...'
-//         });
-//     }
-//     await page.setRequestInterception(true);
-//     page.on('request', (req) => {
-//         const type = req.resourceType();
-//         if (['image', 'stylesheet', 'font', 'media', 'websocket', 'manifest', 'other'].includes(type)) {
-//             req.abort();
-//         } else {
-//             req.continue();
-//         }
-//     });
-//     if (sendEvent) {
-//         sendEvent('step', {
-//             step: 'pincode_block',
-//             status: 'completed',
-//             message: 'Resource blocking enabled.'
-//         });
-//     }
-
-//     // ── Setup viewport, UA, headers ──────────────────────────
-//     await page.setViewport({ width: 1366, height: 768 });
-//     await page.setUserAgent(
-//         'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151.0.0.0 Safari/537.36'
-//     );
-//     await page.setExtraHTTPHeaders({
-//         'Accept-Language': 'en-IN,en-GB;q=0.9,en-US;q=0.8,en;q=0.7',
-//     });
-
-//     // ── Step: Navigate to Flipkart ───────────────────────────
-//     if (sendEvent) {
-//         sendEvent('step', {
-//             step: 'pincode_navigate',
-//             status: 'running',
-//             message: 'Loading Flipkart homepage (lightweight)...'
-//         });
-//     }
-//     try {
-//         await page.goto('https://www.flipkart.com', {
-//             waitUntil: 'commit',
-//             timeout: 30000
-//         });
-//         console.log('Homepage loaded (commit).');
-//         if (sendEvent) {
-//             sendEvent('step', {
-//                 step: 'pincode_navigate',
-//                 status: 'completed',
-//                 message: 'Homepage loaded.'
-//             });
-//         }
-//     } catch (err) {
-//         if (sendEvent) {
-//             sendEvent('step', {
-//                 step: 'pincode_navigate',
-//                 status: 'failed',
-//                 message: `Navigation failed: ${err.message}`
-//             });
-//         }
-//         throw err;
-//     }
-
-//     // ── Step: Close login popup ──────────────────────────────
-//     try {
-//         const closeBtn = await page.waitForSelector('span.b3wTlE', { timeout: 5000 });
-//         if (closeBtn) {
-//             await closeBtn.click();
-//             await delay(1000);
-//             console.log('Login popup closed.');
-//         }
-//     } catch (_) { /* no popup */ }
-
-//     // ── Step: Click location selector ────────────────────────
-//     if (sendEvent) {
-//         sendEvent('step', {
-//             step: 'pincode_location',
-//             status: 'running',
-//             message: 'Opening delivery location selector...'
-//         });
-//     }
-//     try {
-//         const locationSelector = await page.waitForSelector(
-//             'a._3n8fna1co._3n8fna10j._3n8fnaod._3n8fna1._3n8fnac7._1i2djtb9._9nihix1d._1i2djti0',
-//             { timeout: 10000 }
-//         );
-//         if (locationSelector) {
-//             await locationSelector.click();
-//             await delay(1000);
-//             console.log('locationSelector clicked.');
-//             if (sendEvent) {
-//                 sendEvent('step', {
-//                     step: 'pincode_location',
-//                     status: 'completed',
-//                     message: 'Location selector opened.'
-//                 });
-//             }
-//         } else {
-//             throw new Error('Location selector not found');
-//         }
-//     } catch (_) {
-//         // fallback: try clicking any input with 'pincode'
-//         try {
-//             const loc = await page.waitForSelector('input[placeholder*="pincode"]', { timeout: 5000 });
-//             await loc.click();
-//             console.log('Clicked pincode input directly.');
-//             if (sendEvent) {
-//                 sendEvent('step', {
-//                     step: 'pincode_location',
-//                     status: 'completed',
-//                     message: 'Pincode input focused directly.'
-//                 });
-//             }
-//         } catch (__) {
-//             console.log('Could not find location selector; will try input directly.');
-//             if (sendEvent) {
-//                 sendEvent('step', {
-//                     step: 'pincode_location',
-//                     status: 'warning',
-//                     message: 'Location selector not found, proceeding to input.'
-//                 });
-//             }
-//         }
-//     }
-
-//     // ── Step: Find pincode input ─────────────────────────────
-//     if (sendEvent) {
-//         sendEvent('step', {
-//             step: 'pincode_find_input',
-//             status: 'running',
-//             message: 'Searching for pincode input field...'
-//         });
-//     }
-//     let pincodeInput = null;
-//     const selectors = [
-//         'input[placeholder*="Search by area, street name, pin code"]',
-//         'input[class*="pincode"]',
-//         'input[placeholder*="Enter delivery pincode"]'
-//     ];
-//     for (const sel of selectors) {
-//         try {
-//             pincodeInput = await page.waitForSelector(sel, { timeout: 5000 });
-//             if (pincodeInput) {
-//                 console.log(`pincodeInput found with: ${sel}`);
-//                 break;
-//             }
-//         } catch (_) { /* try next */ }
-//     }
-
-//     if (!pincodeInput) {
-//         if (sendEvent) {
-//             sendEvent('step', {
-//                 step: 'pincode_find_input',
-//                 status: 'failed',
-//                 message: 'Pincode input field not found'
-//             });
-//         }
-//         throw new Error('Pincode input field not found');
-//     }
-//     if (sendEvent) {
-//         sendEvent('step', {
-//             step: 'pincode_find_input',
-//             status: 'completed',
-//             message: 'Pincode input found.'
-//         });
-//     }
-
-//     // ── Step: Type pincode ────────────────────────────────────
-//     if (sendEvent) {
-//         sendEvent('step', {
-//             step: 'pincode_type',
-//             status: 'running',
-//             message: `Typing pincode ${pincode}...`
-//         });
-//     }
-//     await pincodeInput.click({ clickCount: 3 });
-//     await pincodeInput.type(pincode, { delay: 100 });
-//     if (sendEvent) {
-//         sendEvent('step', {
-//             step: 'pincode_type',
-//             status: 'completed',
-//             message: `Pincode ${pincode} typed.`
-//         });
-//     }
-
-//     // ── Step: Wait for suggestions ────────────────────────────
-//     await delay(2000);
-
-//     // ── Step: Select suggestion ───────────────────────────────
-//     if (sendEvent) {
-//         sendEvent('step', {
-//             step: 'pincode_suggestion',
-//             status: 'running',
-//             message: 'Waiting for suggestions and selecting matching one...'
-//         });
-//     }
-//     try {
-//         await page.waitForSelector('#msite-bottomsheet', { timeout: 5000 });
-
-//         const clickPosition = await page.evaluate((pincode) => {
-//             const elements = document.querySelectorAll(
-//                 '#msite-bottomsheet div[class*="css-g5y9jx"] .css-146c3p1.r-dnmrzs.r-1udh08x.r-1udbk01.r-3s2u2q.r-1iln25a'
-//             );
-//             for (const el of elements) {
-//                 if (el.querySelector('div[class*="css-g5y9jx"]')) continue;
-//                 const text = el.innerText?.trim() || '';
-//                 if (!text.includes(pincode)) continue;
-//                 if (text.includes('Select delivery address')) continue;
-//                 const rect = el.getBoundingClientRect();
-//                 if (rect.width === 0 || rect.height === 0) continue;
-//                 return {
-//                     x: rect.left + rect.width / 2,
-//                     y: rect.top + rect.height / 2,
-//                     text
-//                 };
-//             }
-//             return null;
-//         }, pincode);
-
-//         if (clickPosition) {
-//             console.log(`🎯 Clicking suggestion: "${clickPosition.text}"`);
-//             await page.mouse.click(clickPosition.x, clickPosition.y);
-//             if (sendEvent) {
-//                 sendEvent('step', {
-//                     step: 'pincode_suggestion',
-//                     status: 'completed',
-//                     message: `Suggestion "${clickPosition.text}" selected.`
-//                 });
-//             }
-//         } else {
-//             console.log('⚠️ No suggestion found, pressing Enter');
-//             await page.keyboard.press('Enter');
-//             if (sendEvent) {
-//                 sendEvent('step', {
-//                     step: 'pincode_suggestion',
-//                     status: 'completed',
-//                     message: 'No suggestion – pressed Enter.'
-//                 });
-//             }
-//         }
-//     } catch (err) {
-//         console.error('Suggestion handling failed, pressing Enter', err.message);
-//         await page.keyboard.press('Enter');
-//         if (sendEvent) {
-//             sendEvent('step', {
-//                 step: 'pincode_suggestion',
-//                 status: 'warning',
-//                 message: `Suggestion error, pressed Enter: ${err.message}`
-//             });
-//         }
-//     }
-
-//     // ── Step: Handle "Try Again" / "Confirm" ──────────────────
-//     if (sendEvent) {
-//         sendEvent('step', {
-//             step: 'pincode_confirm',
-//             status: 'running',
-//             message: 'Handling Try Again / Confirm buttons...'
-//         });
-//     }
-//     await handleTryAgainOrConfirm(page);
-//     if (sendEvent) {
-//         sendEvent('step', {
-//             step: 'pincode_confirm',
-//             status: 'completed',
-//             message: 'Confirmation handled.'
-//         });
-//     }
-
-//     // ── Step: Wait for pincode to apply ──────────────────────
-//     await delay(3000);
-//     console.log(`✅ Pincode ${pincode} set successfully.`);
-//     if (sendEvent) {
-//         sendEvent('step', {
-//             step: 'pincode_done',
-//             status: 'completed',
-//             message: `Pincode ${pincode} fully applied.`
-//         });
-//     }
-
-//     await page.close();
-// }
-
 async function setGlobalPincode(browser, pincode, sendEvent) {
-    const page = await browser.newPage();
+    let page = await browser.newPage();
     const delay = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 
     // Helper to perform navigation with retry
     async function navigateToFlipkart() {
         const maxAttempts = 2;
+
         for (let attempt = 1; attempt <= maxAttempts; attempt++) {
             try {
+                console.log(`🌐 Flipkart navigation attempt ${attempt}/${maxAttempts}`);
+
                 await page.goto('https://www.flipkart.com', {
-                    waitUntil: 'domcontentloaded',   // valid in Puppeteer
-                    timeout: 45000                    // 45 seconds
+                    waitUntil: 'domcontentloaded',
+                    timeout: 45000
                 });
 
-                // await delay(100000);
+                console.log(`✅ Flipkart homepage loaded on attempt ${attempt}`);
                 return true;
+
             } catch (err) {
-                console.error(`Navigation attempt ${attempt} failed: ${err.message}`);
-                if (attempt === maxAttempts) throw err;
-                await delay(3000);
-                // Refresh page state if needed
+                console.error(
+                    `❌ Flipkart navigation attempt ${attempt} failed:`,
+                    err.message
+                );
+
+                // First attempt failed → fresh page create and retry once
+                if (attempt < maxAttempts) {
+                    console.log('🔄 Navigation failed. Creating fresh page and retrying...');
+
+                    try {
+                        await page.close().catch(() => {});
+                    } catch (_) {}
+
+                    await delay(3000);
+
+                    page = await browser.newPage();
+
+                    // Re-apply required page settings
+                    await page.setViewport({
+                        width: 1366,
+                        height: 768
+                    });
+
+                    await page.setUserAgent(
+                        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151.0.0.0 Safari/537.36'
+                    );
+
+                    await page.setExtraHTTPHeaders({
+                        'Accept-Language': 'en-IN,en-GB;q=0.9,en-US;q=0.8,en;q=0.7'
+                    });
+
+                    // Re-enable request interception for new page
+                    await page.setRequestInterception(true);
+
+                    page.on('request', (req) => {
+                        const type = req.resourceType();
+
+                        if (['image', 'font', 'media'].includes(type)) {
+                            req.abort();
+                        } else {
+                            req.continue();
+                        }
+                    });
+
+                    continue;
+                }
+
+                // Both attempts failed
+                throw err;
             }
         }
         return false;
@@ -1195,6 +932,7 @@ async function setGlobalPincode(browser, pincode, sendEvent) {
     await delay(5000);
 
     await handleTryAgainOrConfirm(page);
+    
     if (sendEvent) {
         sendEvent('step', {
             step: 'pincode_confirm',
@@ -1213,8 +951,6 @@ async function setGlobalPincode(browser, pincode, sendEvent) {
             message: `Pincode ${pincode} fully applied.`
         });
     }
-
-    await page.close();
 }
 
 async function handleTryAgainOrConfirm(page) {
