@@ -73,7 +73,7 @@ async function flipkartScraper(req, res) {
         });
 
         browser = await puppeteer.launch({
-            headless: false,
+            headless: true,
             executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || undefined,
             args: [
                 '--no-sandbox',
