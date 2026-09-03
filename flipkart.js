@@ -586,78 +586,36 @@ async function flipkartScraper(req, res) {
 }
 
 async function setGlobalPincode(browser, pincode, sendEvent) {
-    let page = await browser.newPage();
+    const page = await browser.newPage();
     const delay = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 
     // Helper to perform navigation with retry
     async function navigateToFlipkart() {
-        const maxAttempts = 2;
+        try {
+            await page.goto('https://www.flipkart.com', {
+                waitUntil: 'domcontentloaded',
+                timeout: 45000
+            });
 
-        for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+            return true;
+        } catch (err) {
+            console.error(`Flipkart navigation failed: ${err.message}`);
             try {
-                console.log(`🌐 Flipkart navigation attempt ${attempt}/${maxAttempts}`);
+                console.log('Navigation failed. Reloading Flipkart page...');
 
-                await page.goto('https://www.flipkart.com', {
+                await page.reload({
                     waitUntil: 'domcontentloaded',
                     timeout: 45000
                 });
 
-                console.log(`✅ Flipkart homepage loaded on attempt ${attempt}`);
+                console.log('Flipkart page reload successful');
+
                 return true;
-
-            } catch (err) {
-                console.error(
-                    `❌ Flipkart navigation attempt ${attempt} failed:`,
-                    err.message
-                );
-
-                // First attempt failed → fresh page create and retry once
-                if (attempt < maxAttempts) {
-                    console.log('🔄 Navigation failed. Creating fresh page and retrying...');
-
-                    try {
-                        await page.close().catch(() => {});
-                    } catch (_) {}
-
-                    await delay(3000);
-
-                    page = await browser.newPage();
-
-                    // Re-apply required page settings
-                    await page.setViewport({
-                        width: 1366,
-                        height: 768
-                    });
-
-                    await page.setUserAgent(
-                        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151.0.0.0 Safari/537.36'
-                    );
-
-                    await page.setExtraHTTPHeaders({
-                        'Accept-Language': 'en-IN,en-GB;q=0.9,en-US;q=0.8,en;q=0.7'
-                    });
-
-                    // Re-enable request interception for new page
-                    await page.setRequestInterception(true);
-
-                    page.on('request', (req) => {
-                        const type = req.resourceType();
-
-                        if (['image', 'font', 'media'].includes(type)) {
-                            req.abort();
-                        } else {
-                            req.continue();
-                        }
-                    });
-
-                    continue;
-                }
-
-                // Both attempts failed
-                throw err;
+            } catch (reloadErr) {
+                console.error(`Flipkart page reload failed: ${reloadErr.message}`);
+                throw reloadErr;
             }
         }
-        return false;
     }
 
     // ── Step: Clear cookies & cache ──────────────────────────
@@ -932,7 +890,6 @@ async function setGlobalPincode(browser, pincode, sendEvent) {
     await delay(5000);
 
     await handleTryAgainOrConfirm(page);
-    
     if (sendEvent) {
         sendEvent('step', {
             step: 'pincode_confirm',
