@@ -1,10 +1,10 @@
 const express = require('express');
 const cors = require('cors');
-const puppeteer = require('puppeteer');
 
 require('dotenv').config({
     quiet: true
 });
+
 
 const {
     scrapeProduct
