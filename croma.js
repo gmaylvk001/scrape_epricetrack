@@ -352,7 +352,7 @@ async function scrapeSingleProduct(browser, product, companyId, pincode, current
 
 async function launchCromaBrowser() {
     const browser = await puppeteer.launch({
-        headless: "new",
+        headless: false,
         executablePath:
             process.env.PUPPETEER_EXECUTABLE_PATH || undefined,
 
@@ -420,14 +420,12 @@ async function cromaScraper(req, res) {
     res.setHeader('Access-Control-Allow-Origin', '*');
     if (typeof res.flushHeaders === 'function') res.flushHeaders();
 
-    // Client disconnect handling
     let clientDisconnected = false;
     req.on('close', () => {
         clientDisconnected = true;
         console.log('Croma client disconnected');
     });
 
-    // Initial event
     sendEvent('start', {
         status: true,
         message: 'Croma scraping started',
@@ -435,6 +433,12 @@ async function cromaScraper(req, res) {
         companyId,
         isSingleProduct,
     });
+
+    // Track total processed products for end‑time updates
+    let productCount = 0;
+    const cronStartTime = getCurrentIndTimeInfo();
+    let totalProducts = 0;
+    let shouldStop = false; // flag to abort on fatal error
 
     try {
         // --------------------------------------------
@@ -524,11 +528,10 @@ async function cromaScraper(req, res) {
             return;
         }
 
-        const totalProducts = productsToScrape.length;
+        totalProducts = productsToScrape.length;
         const startTime = new Date(
             `${getCurrentIndTimeInfo('India_Railway_Date_Only')}T${getCurrentIndTimeInfo('India_Railway_Time')}`
         );
-        const cronStartTime = getCurrentIndTimeInfo();
 
         // Update start time in DB (only for full cron runs)
         if (!isSingleProduct) {
@@ -550,12 +553,10 @@ async function cromaScraper(req, res) {
         }
 
         const scrapedData = [];
-        let productCount = 0;
 
         // --------------------------------------------
         // 6. Loop over each product
         // --------------------------------------------
-
         for (let productIndex = 0; productIndex < productsToScrape.length; productIndex++) {
             const product = productsToScrape[productIndex];
             const currentNumber = productIndex + 1;
@@ -573,8 +574,10 @@ async function cromaScraper(req, res) {
             });
 
             let scrapeResult;
+            let errorOccurred = false;
 
-            while(true){
+            // Retry loop for pincode mismatch (restart browser)
+            while (true) {
                 try {
                     scrapeResult = await scrapeSingleProduct(
                         browser,
@@ -585,42 +588,35 @@ async function cromaScraper(req, res) {
                         totalProducts,
                         sendEvent
                     );
-                    // Pincode wrong
-                    if (scrapeResult?.restartBrowser){
+
+                    // Pincode wrong – restart browser and retry same product
+                    if (scrapeResult?.restartBrowser) {
                         console.log(`🔄 Restarting browser for product ${currentNumber}`);
-
                         await browser.close();
-
                         browser = await launchCromaBrowser();
-
                         console.log(`✅ Browser restarted. Retrying same product ${currentNumber}`);
-
-                        // SAME PRODUCT RETRY
-                        continue;
+                        continue; // retry
                     }
-                    // Product scraping success
-                    break;
-                } catch (error) {
-                    console.error( `Product ${productId} failed:`,error.message);
-                    // Your existing error handling...
 
-                    scrapeResult = {
-                        price: 'No Result',
-                        stock: 'No Result',
-                        image: 'No Result',
-                        review: 'No Result',
-                        rating: 'No Result',
-                        scrapeStatus: 'pending',
-                    };
+                    // Success (or normal "pending" result from product not found, etc.)
+                    break;
+                } catch (err) {
+                    // Fatal error (e.g., browser crash, navigation failure) – abort entire scraping
+                    console.error(`Fatal error scraping product ${productId}:`, err.message);
+                    errorOccurred = true;
                     break;
                 }
             }
 
-            // -----------------------------------------
-            // Now only after scraping is really finished
-            // update DB / SSE / progress
-            // -----------------------------------------
+            // If a fatal error occurred, stop processing further products (no DB update for this product)
+            if (errorOccurred) {
+                shouldStop = true;
+                break; // exit for loop
+            }
 
+            // -----------------------------------------
+            // Update DB with the scraped result (only if no fatal error)
+            // -----------------------------------------
             try {
                 await updateDocument(
                     'ept_product_details_new_croma',
@@ -636,12 +632,8 @@ async function cromaScraper(req, res) {
                             product_image: scrapeResult.image,
                             product_review: scrapeResult.review,
                             product_rating: scrapeResult.rating,
-                            modified_date:
-                                getCurrentIndTimeInfo(
-                                    'India_Railway_Date_Time'
-                                ),
-                            product_scrape_status:
-                                scrapeResult.scrapeStatus,
+                            modified_date: getCurrentIndTimeInfo('India_Railway_Date_Time'),
+                            product_scrape_status: scrapeResult.scrapeStatus,
                         },
                     }
                 );
@@ -652,8 +644,7 @@ async function cromaScraper(req, res) {
                     productCode,
                     message: `Product ${currentNumber} Updated in DB`,
                 });
-            }
-            catch (dbError){
+            } catch (dbError) {
                 sendEvent('product_complete', {
                     productNumber: currentNumber,
                     productId,
@@ -663,7 +654,7 @@ async function cromaScraper(req, res) {
                 // DB update failed, but scraping should continue
             }
 
-            // Track price changes
+            // Track price changes (only if we have a valid scrapeResult)
             updatePriceChangeData(
                 scrapeResult.scrapeStatus,
                 product.product_price,
@@ -713,20 +704,20 @@ async function cromaScraper(req, res) {
             }
 
             productCount++;
-
             await delay(100);
         }
 
         // --------------------------------------------
-        // 7. Final summary
+        // 7. Final summary (successful completion or early stop due to fatal error)
         // --------------------------------------------
         const endTime = new Date(`${getCurrentIndTimeInfo('India_Railway_Date_Only')}T${getCurrentIndTimeInfo('India_Railway_Time')}`);
         const totalMinutes = +((endTime - startTime) / 60000).toFixed(2);
 
         if (!isSingleProduct) {
+            const status = shouldStop ? 'ending' : 'ending'; // both cases end the cron
             await updateEndTimeInDb(
                 productCount,
-                'ending',
+                status,
                 cmpid,
                 companyId,
                 totalMinutes,
@@ -738,7 +729,7 @@ async function cromaScraper(req, res) {
 
         sendEvent('complete', {
             status: true,
-            message: 'Scraping completed',
+            message: shouldStop ? 'Scraping stopped early due to fatal error' : 'Scraping completed',
             totalProducts,
             totalProcessed: productCount,
             progress: 100,
@@ -749,6 +740,23 @@ async function cromaScraper(req, res) {
         res.end();
     } catch (error) {
         console.error('Croma scraper error:', error);
+        // Update end time as 'ending' in case of catastrophic failure
+        if (!isSingleProduct && totalProducts > 0) {
+            try {
+                await updateEndTimeInDb(
+                    productCount,
+                    'ending',
+                    cmpid,
+                    companyId,
+                    null,
+                    cronName,
+                    cronStartTime,
+                    totalProducts
+                );
+            } catch (dbErr) {
+                console.error('Failed to update end time on error:', dbErr);
+            }
+        }
         if (!res.writableEnded) {
             sendEvent('error', {
                 status: false,
