@@ -1,13 +1,5 @@
-const puppeteer = require('puppeteer');
-const {
-    getCurrentIndTimeInfo,
-    updateStartTimeInDb,
-    updateEndTimeInDb
-} = require('./utils/cronTime');
-
-const { updatePriceChangeData } = require('./utils/priceChange');
-const { getStorePincode } = require('./utils/pinCode');
-const { PincodeApplied } = require('./utils/pincodeApplied');
+const axios = require('axios');
+const cheerio = require('cheerio');
 
 const {
     executeMongoFind,
@@ -15,985 +7,1283 @@ const {
     executeMongoUpdate
 } = require('./mongo');
 
-const cronName = 'vijaysales';
+const {
+    getCurrentIndTimeInfo,
+    updateStartTimeInDb,
+    updateEndTimeInDb
+} = require('./utils/cronTime');
+const { getStorePincode } = require('./utils/pinCode');
 
-// Enhanced Configuration constants
-const CONFIG = {
-    PAGE_TIMEOUT: 30000,
-    DELAY_BETWEEN_PRODUCTS: 300,
-    MONGO_RETRY_DELAY: 2000,
-    MAX_MONGO_RETRIES: 3,
-    MAX_PRODUCT_RETRIES: 3,
-    BROWSER_RESTART_AFTER: 80, // Restart browser after 80 products to prevent memory leaks
-    MAX_CONCURRENT_PAGES: 3,
-    MEMORY_THRESHOLD: 400 * 1024 * 1024, // 400MB
-    BROWSER_ARGS: [
-        '--no-sandbox',
-        '--disable-setuid-sandbox',
-        '--disable-dev-shm-usage',
-        '--disable-gpu',
-        '--disable-software-rasterizer',
-        '--disable-extensions',
-        '--disable-background-networking',
-        '--disable-background-timer-throttling',
-        '--disable-renderer-backgrounding',
-        '--disable-features=Translate,BackForwardCache',
-        '--js-flags=--max-old-space-size=2048',
-        '--memory-pressure-off',
-        '--disable-ipc-flooding-protection',
-        '--disable-backgrounding-occluded-windows',
-        '--disable-breakpad',
-        '--disable-component-extensions-with-background-pages',
-        '--disable-default-apps',
-        '--disable-domain-reliability',
-        '--disable-file-system',
-        '--disable-local-storage',
-        '--disable-session-crashed-bubble',
-        '--disable-translate',
-        '--disable-web-security',
-        '--disable-features=IsolateOrigins,site-per-process',
-        '--max_old_space_size=2048',
-        '--disable-dev-shm-usage',
-        '--single-process', // Use single process to reduce memory
-        '--disable-accelerated-2d-canvas',
-        '--disable-accelerated-jpeg-decoding',
-        '--disable-accelerated-mjpeg-decode',
-        '--disable-accelerated-video-decode'
-    ]
-};
+const {
+    updatePriceChangeData
+} = require('./utils/priceChange');
+
+const cronName = 'vijaysales';
 
 async function vijaysalesScraper(req, res) {
 
-    const delay = (ms) =>
-        new Promise(resolve => setTimeout(resolve, ms));
+    // ---------------------------------------------------------
+    // SSE SETUP
+    // ---------------------------------------------------------
 
-    let browser;
-    let isShuttingDown = false;
-    let productsProcessed = 0;
-    let browserRestartCount = 0;
+    res.setHeader('Content-Type', 'text/event-stream');
+    res.setHeader('Cache-Control', 'no-cache');
+    res.setHeader('Connection', 'keep-alive');
+    res.setHeader('X-Accel-Buffering', 'no');
 
-    // Memory monitoring
-    const memoryMonitor = setInterval(() => {
-        const used = process.memoryUsage();
-        const heapUsedMB = Math.round(used.heapUsed / 1024 / 1024);
-        const heapTotalMB = Math.round(used.heapTotal / 1024 / 1024);
-        console.log(`[Memory] Heap: ${heapUsedMB}MB / ${heapTotalMB}MB, RSS: ${Math.round(used.rss / 1024 / 1024)}MB`);
-        
-        if (used.heapUsed > CONFIG.MEMORY_THRESHOLD) {
-            console.log('⚠️ Memory threshold exceeded, forcing garbage collection');
-            if (global.gc) {
-                global.gc();
-            }
-        }
-    }, 30000);
+    // Flush headers immediately
+    if (typeof res.flushHeaders === 'function') {
+        res.flushHeaders();
+    }
 
-    /*
-    ============================================================
-    SSE RESPONSE HELPERS
-    ============================================================
-    */
-
-    const sendEvent = (event, data) => {
-
-        if (res.writableEnded || isShuttingDown) {
-            return;
-        }
-
+    const sendSSE = (type, data) => {
         try {
-            res.write(`event: ${event}\n`);
+            if (res.writableEnded || res.destroyed) {
+                return;
+            }
+
+            res.write(`event: ${type}\n`);
             res.write(`data: ${JSON.stringify(data)}\n\n`);
 
             if (typeof res.flush === 'function') {
                 res.flush();
             }
         } catch (error) {
-            console.error('Error sending event:', error.message);
+            console.error('SSE send error:', error.message);
         }
     };
 
-    /*
-    ============================================================
-    SAFE MONGO OPERATIONS WITH RETRY
-    ============================================================
-    */
+    // ---------------------------------------------------------
+    // CURL / HTTP CONFIG
+    // ---------------------------------------------------------
 
-    async function safeMongoFind(collection, filter, projection, retries = CONFIG.MAX_MONGO_RETRIES) {
-        for (let attempt = 1; attempt <= retries; attempt++) {
-            try {
-                return await executeMongoFind(collection, filter, projection);
-            } catch (error) {
-                console.error(`MongoDB find attempt ${attempt} failed:`, error.message);
-                
-                if (attempt === retries) {
-                    throw error;
-                }
-                
-                await delay(CONFIG.MONGO_RETRY_DELAY * attempt);
-            }
-        }
-    }
+    const USER_AGENT =
+        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 ' +
+        '(KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36';
 
-    async function safeMongoUpdate(collection, filter, update, retries = CONFIG.MAX_MONGO_RETRIES) {
-        for (let attempt = 1; attempt <= retries; attempt++) {
-            try {
-                return await executeMongoUpdate(collection, filter, update);
-            } catch (error) {
-                console.error(`MongoDB update attempt ${attempt} failed:`, error.message);
-                
-                if (attempt === retries) {
-                    throw error;
-                }
-                
-                await delay(CONFIG.MONGO_RETRY_DELAY * attempt);
-            }
-        }
-    }
-
-    /*
-    ============================================================
-    BROWSER MANAGEMENT WITH RESTART
-    ============================================================
-    */
-
-    const launchBrowser = async () => {
-        console.log(`🚀 Launching browser (Restart #${browserRestartCount})...`);
-        
-        const newBrowser = await puppeteer.launch({
-            headless: 'new', // Use new headless mode which is more memory efficient
-            executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || undefined,
-            args: CONFIG.BROWSER_ARGS,
-            timeout: 30000,
-            devtools: false,
-            ignoreDefaultArgs: [
-                '--enable-automation',
-                '--disable-web-security'
-            ],
-            defaultViewport: null
-        });
-
-        // Clear browser context for fresh start
-        const context = newBrowser.defaultBrowserContext();
-        await context.clearPermissionOverrides();
-        
-        return newBrowser;
-    };
-
-    const restartBrowser = async (applyPincode = true) => {
-        console.log('🔄 Restarting browser to free memory...');
-        browserRestartCount++;
-        
-        if (browser) {
-            try {
-                await browser.close();
-            } catch (error) {
-                console.error('Error closing browser:', error);
-            }
-        }
-        
-        browser = await launchBrowser();
-        
-        productsProcessed = 0;
-        
-        // Force garbage collection
-        if (global.gc) {
-            global.gc();
-        }
-        
-        console.log(`✅ Browser restarted successfully (Restart #${browserRestartCount})`);
-    };
-
-    /*
-    ============================================================
-    CREATE NEW PAGE WITH OPTIMIZED SETTINGS
-    ============================================================
-    */
     
-    const createNewPage = async () => {
-        const newPage = await browser.newPage();
-        
-        // Optimize page settings - LESS BLOCKING to avoid timeouts
-        await newPage.setRequestInterception(true);
-        
-        // Block only heavy resources
-        newPage.on('request', (req) => {
-            const resourceType = req.resourceType();
-            // Only block heavy resources, allow critical ones
-            if (['image', 'font', 'media'].includes(resourceType)) {
-                req.abort();
-            } else {
-                req.continue();
+    const fetchProductPage = async (url, attempt = 1) => {
+
+        const maxAttempts = 3;
+
+        try {
+
+            const response = await axios.get(url, {
+                timeout: 30000,
+
+                maxRedirects: 5,
+
+                // Do not throw for normal HTTP responses.
+                validateStatus: (status) => {
+                    return status >= 200 && status < 500;
+                },
+
+                headers: {
+                    'User-Agent': USER_AGENT,
+
+                    'Accept':
+                        'text/html,application/xhtml+xml,application/xml;q=0.9,' +
+                        'image/avif,image/webp,*/*;q=0.8',
+
+                    'Accept-Language':
+                        'en-IN,en;q=0.9,en-US;q=0.8',
+
+                    'Accept-Encoding':
+                        'gzip, deflate, br',
+
+                    'Cache-Control':
+                        'no-cache',
+
+                    'Pragma':
+                        'no-cache',
+
+                    'Upgrade-Insecure-Requests':
+                        '1',
+
+                    'Sec-Fetch-Dest':
+                        'document',
+
+                    'Sec-Fetch-Mode':
+                        'navigate',
+
+                    'Sec-Fetch-Site':
+                        'none',
+
+                    'Sec-Fetch-User':
+                        '?1',
+
+                    'Connection':
+                        'keep-alive'
+                },
+
+                // Prevent axios from converting response unexpectedly.
+                responseType: 'text',
+
+                decompress: true
+            });
+
+            if (response.status < 200 || response.status >= 400) {
+                throw new Error(
+                    `Vijaysales returned HTTP ${response.status}`
+                );
             }
-        });
-        
-        await newPage.setUserAgent(
-            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
-        );
-        
-        await newPage.setViewport({
-            width: 1366,
-            height: 768
-        });
-        
-        // Set shorter timeouts
-        newPage.setDefaultTimeout(CONFIG.PAGE_TIMEOUT);
-        newPage.setDefaultNavigationTimeout(CONFIG.PAGE_TIMEOUT);
-        
-        // Disable unnecessary features
-        await newPage.evaluateOnNewDocument(() => {
-            // Disable animations
-            const style = document.createElement('style');
-            style.textContent = `
-                * {
-                    animation-duration: 0s !important;
-                    transition-duration: 0s !important;
-                }
-            `;
-            document.head.appendChild(style);
-        });
-        
-        return newPage;
+
+            if (!response.data) {
+                throw new Error('Empty response from Vijaysales');
+            }
+
+            return response.data;
+
+        } catch (error) {
+
+            console.error(
+                `Vijaysales request failed (attempt ${attempt}/${maxAttempts}):`,
+                error.message
+            );
+
+            if (attempt < maxAttempts) {
+
+                // Small retry delay
+                await new Promise(resolve =>
+                    setTimeout(resolve, 1500 * attempt)
+                );
+
+                return fetchProductPage(
+                    url,
+                    attempt + 1
+                );
+            }
+
+            throw error;
+        }
     };
 
-    /*
-    ============================================================
-    CLOSE PAGE WITH CLEANUP
-    ============================================================
-    */
+   
+    const getVijaySalesVanNo = (url) => {
+        try {
+            const match = url.match(/\/p\/(\d+)(?:\/|$)/);
+
+            return match ? match[1] : '';
+        } catch (error) {
+            console.error(
+                'Failed to extract Vijay Sales vanNo:',
+                error.message
+            );
+
+            return '';
+        }
+    };
+
+    const getVijaySalesStock = async (pincode, Pcode) => {
+        
+        try {
+            const stockUrl =
+                `https://oms.vijaysales.systems/v1/servicability` +
+                `?pincode=${encodeURIComponent(pincode)}` +
+                `&vanNo=${encodeURIComponent(Pcode)}` +
+                `&storeList=true`;
+
+            const response = await axios.get(stockUrl, {
+                timeout: 30000,
+                validateStatus: () => true,
+                headers: {
+                    'User-Agent': USER_AGENT,
+                    'Accept': 'application/json, text/plain, */*',
+                    'Accept-Language': 'en-IN,en;q=0.9',
+                    'Referer': 'https://www.vijaysales.com/',
+                    'Origin': 'https://www.vijaysales.com',
+                    'Connection': 'keep-alive'
+                }
+            });
+
+            if (response.status !== 200) {
+                console.log('Vijay Sales stock API failed:', {
+                    status: response.status,
+                    url: stockUrl,
+                    data: response.data
+                });
+
+                return;
+            }
+
+            const stockData = response.data?.data?.[Pcode];
+
+            const stockStatus =
+                stockData?.isServiceable === true
+                    ? 'instock'
+                    : 'outofstock';
+            return stockStatus;
+
+        } catch (error) {
+            console.error(
+                'Vijay Sales stock API error:',
+                error.message
+            );
+
+            return;
+        }
+    };
+
+    const getVijaySalesReview = async (Pcode) => {
+        
+        try {
+            const reviewUrl =
+                `https://crm-service.vijaysales.systems/v1/reviews/getReviewCount` +
+                `?van=${encodeURIComponent(Pcode)}`;
+
+            const response = await axios.get(reviewUrl, {
+                timeout: 30000,
+                validateStatus: () => true,
+                headers: {
+                    'User-Agent': USER_AGENT,
+                    'Accept': 'application/json, text/plain, */*',
+                    'Accept-Language': 'en-IN,en;q=0.9',
+                    'Referer': 'https://www.vijaysales.com/',
+                    'Origin': 'https://www.vijaysales.com',
+                    'Connection': 'keep-alive'
+                }
+            });
+
+            if (response.status !== 200) {
+                console.log('Vijay Sales review API failed:', {
+                    status: response.status,
+                    url: stockUrl,
+                    data: response.data
+                });
+                return;
+            }
+
+            const reviewData = response.data;
+            return reviewData;
+
+        } catch (error) {
+            console.error(
+                'Vijay Sales Review API error:',
+                error.message
+            );
+
+            return;
+        }
+    };
+
+    // ---------------------------------------------------------
+    // PARSE Vijaysales PRODUCT HTML
+    // ---------------------------------------------------------
     
-    const closePage = async (page) => {
-        if (page && !page.isClosed()) {
+
+    const parseVIJAYSALESProduct = async (html, productUrl, companyId) => {
+
+        const $ = cheerio.load(html);
+
+        let name = '';
+        let price = '';
+        let availability = '';
+        let image = '';
+        let review = 0;
+        let rating = 0;
+
+        // =====================================================
+        // 1. GET VAN NO
+        // =====================================================
+
+        const vanNo = getVijaySalesVanNo(productUrl);
+
+        // =====================================================
+        // 2. GET PINCODE
+        // =====================================================
+
+        let pincode = await getStorePincode(companyId);
+
+        if (pincode === null || !pincode) {
+            pincode = req.query.pincode || 600018;
+        }
+
+        // =====================================================
+        // 3. CHECK STOCK
+        // =====================================================
+
+        if (pincode && vanNo) {
+
+            availability = await getVijaySalesStock(
+                pincode,
+                vanNo
+            );
+        }
+
+        // =====================================================
+        // 4. GET RATING & REVIEW
+        // =====================================================
+
+        if (vanNo) {
+
+            const ratingAndReview = await getVijaySalesReview(
+                vanNo
+            );
+
+            if (ratingAndReview?.success === true) {
+
+                rating =
+                    ratingAndReview?.data?.averageRating || 0;
+
+                review =
+                    ratingAndReview?.data?.totalReviewCount || 0;
+            }
+        }
+
+        // =====================================================
+        // 5. PRODUCT JSON-LD SCHEMA
+        // =====================================================
+
+        $('script[type="application/ld+json"]').each((i, el) => {
+
+            if (name && price) {
+                return;
+            }
+
+            const scriptText = $(el).html() || '';
+
+            if (!scriptText.trim()) {
+                return;
+            }
+
             try {
-                // Clear all event listeners
-                page.removeAllListeners();
-                
-                // Clear cookies
-                const cookies = await page.cookies();
-                if (cookies.length > 0) {
-                    await page.deleteCookie(...cookies);
+
+                const productData = JSON.parse(scriptText);
+
+                // Only Product schema
+                if (productData?.['@type'] !== 'Product') {
+                    return;
                 }
-                
-                // Close page
-                await page.close({ runBeforeUnload: true });
-                
-                console.log('✅ Page closed and cleaned up');
+
+                // =================================================
+                // PRODUCT NAME
+                // =================================================
+
+                name = productData?.name || '';
+
+                // =================================================
+                // PRICE
+                // =================================================
+
+                price = productData?.offers?.price || '';
+
+                // =================================================
+                // IMAGE
+                // =================================================
+
+                const schemaImage = productData?.image || '';
+
+                if (Array.isArray(schemaImage)) {
+
+                    image = schemaImage[0] || '';
+
+                } else {
+
+                    image = schemaImage;
+                }
+
             } catch (error) {
-                console.error('Error closing page:', error.message);
+
+                console.error(
+                    'Vijay Sales JSON-LD parse error:',
+                    error.message
+                );
             }
-        }
-    };
 
-    /*
-    ============================================================
-    REQUEST VALIDATION
-    ============================================================
-    */
-
-    const cmpid = req.query.cmpid;
-
-    if (!cmpid) {
-        return res.status(400).json({
-            status: false,
-            message: 'cmpid is required'
         });
-    }
 
-    const companyId = cmpid.replace('plm_user_info_', '');
+        // =====================================================
+        // 6. RETURN PRODUCT DATA
+        // =====================================================
 
-    const ean = req.query.ean;
-    const itemcode = req.query.itemcode;
-    const pincode = req.query.pincode || '110001';
-
-    const isSingleProduct = !!(ean && itemcode);
-
-    res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
-    res.setHeader('Cache-Control', 'no-cache, no-transform');
-    res.setHeader('Connection', 'keep-alive');
-    res.setHeader('X-Accel-Buffering', 'no');
-    res.setHeader('Access-Control-Allow-Origin', '*');
-
-    if (typeof res.flushHeaders === 'function') {
-        res.flushHeaders();
-    }
-
-    let clientDisconnected = false;
-
-    req.on('close', () => {
-        clientDisconnected = true;
-        console.log('Vijaysales client disconnected');
-        clearInterval(memoryMonitor);
-    });
-
-    /*
-    ============================================================
-    SAFE SHUTDOWN
-    ============================================================
-    */
-
-    const gracefulShutdown = async () => {
-        if (isShuttingDown) return;
-        isShuttingDown = true;
-        
-        console.log('Starting graceful shutdown...');
-        clearInterval(memoryMonitor);
-
-        if (browser) {
-            console.log('Closing browser...');
-            try {
-                await browser.close();
-            } catch (error) {
-                console.error('Browser close error:', error);
-            }
-        }
+        return {
+            name,
+            availability,
+            price,
+            image,
+            review,
+            rating
+        };
     };
 
-    sendEvent('start', {
-        status: true,
-        message: 'Vijaysales scraping started',
-        cmpid,
-        companyId,
-        isSingleProduct,
-        pincode
-    });
+    // ---------------------------------------------------------
+    // MAIN
+    // ---------------------------------------------------------
 
     try {
-        sendEvent('step', {
-            step: 'browser',
-            status: 'running',
-            message: 'Launching browser...'
+
+        const cmpid = req.query.cmpid;
+
+        if (!cmpid) {
+
+            sendSSE('error', {
+                message: 'cmpid is required'
+            });
+
+            return res.end();
+        }
+
+        const companyId =
+        cmpid.replace('plm_user_info_', '');
+
+        const ean = req.query.ean;
+        const itemcode = req.query.itemcode;
+
+        const isSingleProduct =
+            !!(ean && itemcode);
+
+        // -----------------------------------------------------
+        // START
+        // -----------------------------------------------------
+
+        sendSSE('start', {
+            status: true,
+            message: 'Vijaysales scraping started',
+            cmpid,
+            companyId,
+            isSingleProduct
         });
 
-        browser = await launchBrowser();
-
-        sendEvent('step', {
-            step: 'products',
-            status: 'running',
-            message: 'Fetching Vijaysales products...'
-        });
+        // -----------------------------------------------------
+        // FILTER
+        // -----------------------------------------------------
 
         const filter = {
+
             status: 'active',
+
             product_scrape_status: {
-                $in: ['pending', 'completed']
+                $in: [
+                    'pending',
+                    'completed'
+                ]
             },
+
             product_url: {
-                $nin: ['', null, 'No Result']
+                $nin: [
+                    '',
+                    null,
+                    'No Result'
+                ]
             }
         };
 
+        // -----------------------------------------------------
+        // SINGLE PRODUCT
+        // -----------------------------------------------------
+
         if (isSingleProduct) {
-            filter[`${companyId}_product_id`] = ean;
-            filter[`${companyId}_product_code`] = itemcode;
+
+            filter[
+                `${companyId}_product_id`
+            ] = ean;
+
+            filter[
+                `${companyId}_product_code`
+            ] = itemcode;
         }
 
-        let products;
-        try {
-            products = await safeMongoFind(
-                {
-                    collection: 'ept_product_details_new_vijaysales',
-                    cmpid
-                },
-                filter,
-                { _id: 0 }
-            );
-        } catch (error) {
-            console.error('Failed to fetch products from MongoDB:', error);
-            sendEvent('error', {
-                status: false,
-                message: 'Database connection error. Please try again.'
-            });
-            res.end();
-            return;
-        }
+        // -----------------------------------------------------
+        // FETCH PRODUCTS
+        // -----------------------------------------------------
+
+        sendSSE('step', {
+            step: 'products',
+            status: 'running',
+            message: 'Fetching products from database...'
+        });
+
+        const products = await executeMongoFind(
+            {
+                collection:
+                    'ept_product_details_new_vijaysales',
+                cmpid
+            },
+            filter,
+            {
+                _id: 0
+            }
+        );
+
+        // -----------------------------------------------------
+        // NO PRODUCTS
+        // -----------------------------------------------------
 
         if (!products || products.length === 0) {
-            sendEvent('complete', {
+
+            sendSSE('complete', {
                 status: true,
-                message: 'Competitor products not found',
-                totalProcessed: 0
+                message: 'Products Not Found',
+                totalProcessed: 0,
+                data: []
             });
-            res.end();
-            return;
+
+            return res.end();
         }
 
-        let existingProducts;
-        try {
-            existingProducts = await safeMongoFind(
+        sendSSE('products_found', {
+            message:
+                `Found ${products.length} products in source collection`,
+            count: products.length
+        });
+
+        // -----------------------------------------------------
+        // FETCH EXISTING PRODUCTS
+        // -----------------------------------------------------
+
+        sendSSE('step', {
+            step: 'matching',
+            status: 'running',
+            message: 'Matching products with main product collection...'
+        });
+
+        const existingProducts =
+            await executeMongoFind(
                 {
-                    collection: 'ept_product_details_new',
+                    collection:
+                        'ept_product_details_new',
                     cmpid
                 },
-                { status: 'active' },
+                {
+                    $and: [
+                        {
+                            status: 'active'
+                        },
+                        {
+                            ean_product_data_details_scrap_status:
+                                'completed'
+                        }
+                    ]
+                },
                 {
                     _id: 0,
                     product_ean_id: 1,
                     product_code: 1
                 }
             );
-        } catch (error) {
-            console.error('Failed to fetch existing products:', error);
-            existingProducts = [];
-        }
+
+        // -----------------------------------------------------
+        // CREATE PRODUCT MAP
+        // -----------------------------------------------------
 
         const productMap = new Set();
-        existingProducts.forEach((row) => {
-            productMap.add(`${row.product_ean_id}_${row.product_code}`);
+
+        if (Array.isArray(existingProducts)) {
+
+            existingProducts.forEach(row => {
+
+                const key =
+                    `${row.product_ean_id}_${row.product_code}`;
+
+                productMap.add(key);
+            });
+        }
+
+        // -----------------------------------------------------
+        // FILTER PRODUCTS
+        // -----------------------------------------------------
+
+        const ArrGetProductInfo = [];
+
+        products.forEach(product => {
+
+            const productId =
+                product[
+                    `${companyId}_product_id`
+                ];
+
+            const productCode =
+                product[
+                    `${companyId}_product_code`
+                ];
+
+            const productUrl =
+                product.product_url;
+
+            if (!productUrl) {
+                return;
+            }
+
+            const key =
+                `${productId}_${productCode}`;
+
+            // Only matching main products
+            if (!productMap.has(key)) {
+                return;
+            }
+
+            // Only Vijaysales URLs
+            if (
+                !productUrl
+                    .toLowerCase()
+                    .startsWith('https://www.vijaysales.com/p')
+            ) {
+                return;
+            }
+
+            ArrGetProductInfo.push(product);
         });
 
-        const ArrGetProductInfo = products.filter((arrTmp) => {
-            const key = `${arrTmp[`${companyId}_product_id`]}_${arrTmp[`${companyId}_product_code`]}`;
-            return productMap.has(key);
-        });
-
-        products.length = 0;
-        existingProducts.length = 0;
+        // -----------------------------------------------------
+        // NO MATCHING PRODUCTS
+        // -----------------------------------------------------
 
         if (ArrGetProductInfo.length === 0) {
-            sendEvent('complete', {
+
+            sendSSE('complete', {
                 status: true,
-                message: 'Active products not found',
-                totalProcessed: 0
+                message: 'Active Products Not Found',
+                totalProcessed: 0,
+                data: []
             });
-            res.end();
-            return;
+
+            return res.end();
+        }
+
+        sendSSE('filtered_products', {
+            message:
+                `Found ${ArrGetProductInfo.length} products to scrape`,
+            count:
+                ArrGetProductInfo.length
+        });
+
+        // -----------------------------------------------------
+        // SCRAPING COUNT
+        // -----------------------------------------------------
+
+        const ScrapingProductCount =
+            ArrGetProductInfo.length;
+
+        const startTime =
+            new Date(
+                `${getCurrentIndTimeInfo(
+                    'India_Railway_Date_Only'
+                )}T${getCurrentIndTimeInfo(
+                    'India_Railway_Time'
+                )}`
+            );
+
+        const cronStarttime =
+            getCurrentIndTimeInfo();
+
+        // -----------------------------------------------------
+        // CRON START
+        // -----------------------------------------------------
+
+        if (!isSingleProduct) {
+
+            await updateStartTimeInDb(
+                cmpid,
+                companyId,
+                cronName,
+                ScrapingProductCount
+            );
         }
 
         let productCount = 0;
-        let successfulScrapes = 0;
-        let failedScrapes = 0;
-        const ScrapingProductCount = ArrGetProductInfo.length;
-        const startTime = new Date(`${getCurrentIndTimeInfo('India_Railway_Date_Only')}T${getCurrentIndTimeInfo('India_Railway_Time')}`);
-        const cronStartTime = getCurrentIndTimeInfo();
 
-        if (!isSingleProduct) {
-            try {
-                await updateStartTimeInDb(cmpid, companyId, cronName, ScrapingProductCount);
-            } catch (error) {
-                console.error('Failed to update start time:', error);
-            }
-        }
+        const scrapedData = [];
 
-        sendEvent('progress', {
-            status: 'running',
-            totalProducts: ScrapingProductCount,
-            processedProducts: 0,
-            progress: 0,
-            message: `${ScrapingProductCount} products found`
-        });
+        // -----------------------------------------------------
+        // PRODUCT LOOP
+        // -----------------------------------------------------
 
+        for (
+            const product
+            of ArrGetProductInfo
+        ) {
 
-        /*
-        ========================================================
-        PINCODE SETUP
-        ========================================================
-        */
+            const productId =
+                product[
+                    `${companyId}_product_id`
+                ];
 
-        let pincode = await getStorePincode(companyId);
-        if (pincode === null) {
-            pincode = req.query.pincode || '600008';
-        }
+            const productCode =
+                product[
+                    `${companyId}_product_code`
+                ];
 
-        console.log('Using pincode:', pincode);
+            const productUrl =
+                product.product_url;
 
+            // -------------------------------------------------
+            // PROGRESS
+            // -------------------------------------------------
 
-        /*
-        ========================================================
-        OPTIMIZED NAVIGATION WITH RETRY
-        ========================================================
-        */
+            sendSSE('progress', {
 
-        async function navigateToPage(page, url, retries = 3) {
-            for (let attempt = 1; attempt <= retries; attempt++) {
-                try {
-                    console.log(`🌐 Navigation attempt ${attempt} for ${url.substring(0, 50)}...`);
-                    
-                    await page.goto(url, {
-                        waitUntil: 'domcontentloaded',
-                        timeout: 15000
-                    });
-                    
-                    // Check if page loaded successfully
-                    const title = await page.title().catch(() => '');
-                    if (title && !title.includes('Robot') && !title.includes('Sorry')) {
-                        console.log(`✅ Page loaded successfully (attempt ${attempt})`);
-                        return true;
-                    }
-                    
-                    throw new Error('Page loaded but appears to be blocked or empty');
-                    
-                } catch (error) {
-                    console.log(`Navigation attempt ${attempt} failed:`, error.message);
-                    
-                    if (attempt === retries) {
-                        return false;
-                    }
-                    
-                    // Exponential backoff
-                    const waitTime = Math.pow(2, attempt) * 2000;
-                    console.log(`Waiting ${waitTime}ms before retry...`);
-                    await delay(waitTime);
-                    
-                    // Refresh page state
-                    try {
-                        await page.reload({ timeout: 10000 });
-                    } catch (e) {}
-                }
-            }
-            return false;
-        }
+                current:
+                    productCount + 1,
 
-        /*
-        ========================================================
-        PROCESS SINGLE PRODUCT WITH RETRY
-        ========================================================
-        */
-        
-        async function processSingleProduct(product, retryCount = 0) {
-            if (clientDisconnected || isShuttingDown) {
-                return;
-            }
+                total:
+                    ScrapingProductCount,
 
-            const productUrl = product.product_url;
-            const productId = product[`${companyId}_product_id`];
-            const productCode = product[`${companyId}_product_code`];
-            
-            let hostname;
-            try {
-                hostname = new URL(productUrl).hostname;
-            } catch (error) {
-                console.error('Invalid product URL:', productUrl);
-                sendEvent('product_error', {
+                product_id:
                     productId,
+
+                product_code:
                     productCode,
-                    status: 'error',
-                    message: 'Invalid product URL'
-                });
-                failedScrapes++;
-                return;
-            }
 
-            if (!hostname.includes('vijaysales')) {
-                sendEvent('product_error', {
-                    productId,
-                    productCode,
-                    status: 'error',
-                    message: 'Only Vijaysales URLs supported'
-                });
-                failedScrapes++;
-                return;
-            }
+                url:
+                    productUrl,
 
-            productCount++;
-            const currentProductNumber = productCount;
-            const currentProgress = Math.round(((currentProductNumber - 1) / ScrapingProductCount) * 100);
-
-            sendEvent('product_start', {
-                productNumber: currentProductNumber,
-                totalProducts: ScrapingProductCount,
-                progress: currentProgress,
-                productId,
-                productCode,
-                productUrl,
-                status: 'running',
-                retryCount: retryCount,
-                message: `Scraping product ${currentProductNumber} of ${ScrapingProductCount}`
+                percentage:
+                    Math.round(
+                        (
+                            (productCount + 1) /
+                            ScrapingProductCount
+                        ) * 100
+                    )
             });
 
-            let varProductPrice = 'No Result';
-            let varProductStock = 'No Result';
-            let varProductImage = 'No Result';
-            let varProductReview = 'No Result';
-            let varProductRating = 'No Result';
-            let scrapeStatus = 'pending';
-            let modifiedDate;
+            // -------------------------------------------------
+            // URL VALIDATION
+            // -------------------------------------------------
 
-            let page = null;
+            let hostname;
 
             try {
-                sendEvent('product_step', {
-                    productNumber: currentProductNumber,
-                    productId,
-                    productCode,
-                    step: 'page_loading',
-                    status: 'running',
-                    message: 'Opening Vijaysales product page...'
-                });
 
-                // Create a new page for this product
-                page = await createNewPage();
+                hostname =
+                    new URL(productUrl)
+                        .hostname
+                        .toLowerCase();
 
-                const navigationSuccess = await navigateToPage(page, productUrl);
-                
-                if (!navigationSuccess) {
-                    throw new Error('Failed to load page after multiple attempts');
-                }
+            } catch (error) {
 
-                sendEvent('product_step', {
-                    productNumber: currentProductNumber,
-                    productId,
-                    productCode,
-                    step: 'page_loaded',
-                    status: 'completed',
-                    message: 'Page loaded successfully'
-                });
+                sendSSE('product_error', {
 
-                // Check if product title exists
-                const productTitleExists = await page.waitForSelector('h1.productFullDetail__productName', { 
-                    timeout: 5000 
-                }).catch(() => null);
-
-               if (!productTitleExists) {
-                
-                    sendEvent('product_step', {
-                        productNumber: currentProductNumber,
+                    product_id:
                         productId,
+
+                    product_code:
                         productCode,
-                        step: 'product_title',
-                        status: 'failed',
-                        message: 'Product title not found'
+
+                    error:
+                        'Invalid product URL'
+                });
+
+                continue;
+            }
+
+            if (!hostname.includes('vijaysales.com')) {
+
+                sendSSE('warning', {
+
+                    message:
+                        'Only Vijaysales URLs supported',
+
+                    url:
+                        productUrl
+                });
+
+                continue;
+            }
+
+            // -------------------------------------------------
+            // DEFAULT VALUES
+            // -------------------------------------------------
+
+            let varProductPrice =
+                'No Result';
+
+            let varProductStock =
+                'No Result';
+
+            let varProductImage =
+                'No Result';
+
+            let varProductReview =
+                'No Result';
+
+            let varProductRating =
+                'No Result';
+
+            let scrapeStatus =
+                'pending';
+
+            // -------------------------------------------------
+            // SCRAPE
+            // -------------------------------------------------
+
+            try {
+
+                sendSSE('product_start', {
+
+                    product_id:
+                        productId,
+
+                    product_code:
+                        productCode,
+
+                    url:
+                        productUrl,
+
+                    status:
+                        'scraping'
+                });
+
+                // -------------------------------------------------
+                // HTTP REQUEST
+                // -------------------------------------------------
+
+                const html =
+                    await fetchProductPage(
+                        productUrl
+                    );
+
+                // -------------------------------------------------
+                // PARSE HTML
+                // -------------------------------------------------
+
+                const result =
+                   await parseVIJAYSALESProduct(html, productUrl, companyId);
+
+                // -------------------------------------------------
+                // PRODUCT NOT FOUND
+                // -------------------------------------------------
+
+                if (result === null) {
+
+                    varProductPrice =
+                        'No Result';
+
+                    varProductStock =
+                        'No Result';
+
+                    varProductImage =
+                        'No Result';
+
+                    varProductReview =
+                        'No Result';
+
+                    varProductRating =
+                        'No Result';
+
+                    scrapeStatus =
+                        'pending';
+
+                    sendSSE('product_failed', {
+
+                        product_id:
+                            productId,
+
+                        product_code:
+                            productCode,
+
+                        reason:
+                            'Product JSON/schema not found'
                     });
-                    failedScrapes++;
 
                 } else {
 
-                    sendEvent('product_step', {
-                        productNumber: currentProductNumber,
-                        productId,
-                        productCode,
-                        step: 'extracting',
-                        status: 'running',
-                        message: 'Extracting product information...'
-                    });
+                    // -------------------------------------------------
+                    // AVAILABILITY
+                    // -------------------------------------------------
 
-                    // Extract data with multiple selector strategies
-                    const result = await page.evaluate(async ({ productUrl, pincode }) => {
+                    const status =
+                        (
+                            result.availability ||
+                            ''
+                        )
+                            .toLowerCase()
+                            .trim();
 
-                        const getText = (selector) => {
-                            const el = document.querySelector(selector);
-                            return el ? el.textContent.trim() : '';
-                        };
+                    // -------------------------------------------------
+                    // IMAGE
+                    // -------------------------------------------------
 
-                        const getAttr = (selector, attr) => {
-                            const el = document.querySelector(selector);
-                            return el ? el.getAttribute(attr) : '';
-                        };
+                    varProductImage =
+                        result.image ||
+                        'No Result';
 
-                        let vanNo = null;
-                        let availablestatus = "outofstock";
-                        let availabilityError = "";
+                    // -------------------------------------------------
+                    // REVIEW
+                    // -------------------------------------------------
 
-                        const match = productUrl.match(/\/p\/(?:P\d+\/)?(\d+)/);
+                    varProductReview =
+                        parseFloat(
+                            result.review
+                        ) || 0;
 
-                        if (match) {
-                            vanNo = match[1];
-                        }
+                    // -------------------------------------------------
+                    // RATING
+                    // -------------------------------------------------
 
-                        if (vanNo && pincode) {
-                            try {
-                                const res = await fetch(
-                                    `https://oms.vijaysales.systems/v1/servicability?pincode=${pincode}&vanNo=${vanNo}&storeList=true`
-                                );
+                    varProductRating =
+                        parseFloat(
+                            result.rating
+                        ) || 0;
 
-                                if (res.ok) {
-                                    const data = await res.json();
+                    // -------------------------------------------------
+                    // PRICE
+                    // -------------------------------------------------
 
-                                    if (data?.data?.[vanNo]?.isServiceable === true) {
-                                        availablestatus = "instock";
-                                    } else {
-                                        availabilityError = "Product is not serviceable for this pincode";
-                                    }
-                                } else {
-                                    availabilityError = `Serviceability API failed with status ${res.status}`;
-                                }
-                            } catch (error) {
-                                availabilityError = "Unable to check product serviceability";
-                            }
-                        } else {
-                            if (!vanNo && !pincode) {
-                                availabilityError = "Van number and pincode are missing";
-                            } else if (!vanNo) {
-                                availabilityError = "Van number is missing";
-                            } else if (!pincode) {
-                                availabilityError = "Pincode is missing";
-                            }
-                        }
+                    const cleanedPrice =
+                        result.price || '';
 
-                        const reviewText = getText('.product__title--stats') || '';
-                        const rating = parseFloat(reviewText.match(/^\d+(\.\d+)?/)?.[0]) || 0;
-                        const review = parseInt(reviewText.match(/\((\d+)\s*Ratings/i)?.[1]) || 0;
+                    const numericPrice =
+                        parseFloat(
+                            String(cleanedPrice)
+                                .replace(/[^0-9.]/g, '')
+                        ) || 0;
 
-                        return {
-                            price: getText('div.product__price--deatils div.product__price--vsp-wrap p.product__price--vsp span') || '',
-                            availability: availablestatus,
-                            availabilityError: availabilityError,
-                            vanNo: vanNo,
-                            pincode: pincode,
-                            image: getAttr('.carousel__currentImage', 'src') || '',
-                            review: review,
-                            rating: rating
-                        };
+                    // -------------------------------------------------
+                    // STOCK
+                    // -------------------------------------------------
 
-                    }, {
-                        productUrl,
-                        pincode
-                    });
+                    if (
+                        (
+                            status.includes('instock') ||
+                            status.includes('in stock')
+                        ) &&
+                        numericPrice > 0
+                    ) {
 
-                    if (result !== null) {
+                        varProductPrice =
+                            numericPrice;
 
-                        const status = (result.availability || '').toLowerCase().trim();
+                        varProductStock =
+                            'In stock';
 
-                        varProductImage = result.image || 'No Result';
-                        varProductReview = result.review != null ? Number(result.review) : 'No Result';
-                        varProductRating = result.rating != null ? Number(result.rating) : 'No Result';
+                    } else if (
+                        status.includes('outofstock') ||
+                        status.includes('out of stock') ||
+                        status.includes('currently unavailable')
+                    ) {
 
-                        if (status.includes('instock')) {
-                            const cleanedPrice = (result.price || '').replace(/[^0-9.]/g, '');
-                            varProductPrice = parseFloat(cleanedPrice) || 'No Result';
-                            varProductStock = 'In stock';
-                        } else if (status.includes('outofstock') || status.includes('currently unavailable')) {
-                            varProductStock = 'Out Of Stock';
-                        } else {
-                            varProductStock = 'No Result';
-                        }
+                        varProductStock =
+                            'Out Of Stock';
 
-                        scrapeStatus = 'completed';
-                        successfulScrapes++;
+                        // Keep price as No Result
+                        // for unavailable products.
 
                     } else {
-                        failedScrapes++;
-                        throw new Error('Failed to extract product data');
+
+                        // Unknown availability.
+                        // If price exists, keep it,
+                        // otherwise No Result.
+
+                        if (numericPrice > 0) {
+
+                            varProductPrice =
+                                numericPrice;
+                        }
+
+                        if (status) {
+
+                            varProductStock =
+                                status;
+                        }
                     }
+
+                    scrapeStatus =
+                        'completed';
                 }
 
-                modifiedDate = getCurrentIndTimeInfo('India_Railway_Date_Time');
+                // -------------------------------------------------
+                // MODIFIED DATE
+                // -------------------------------------------------
 
-                // Update price change data
-                updatePriceChangeData(
+                const modifiedDate =
+                    getCurrentIndTimeInfo(
+                        'India_Railway_Date_Time'
+                    );
+
+                // -------------------------------------------------
+                // PRICE CHANGE
+                // -------------------------------------------------
+
+                await updatePriceChangeData(
+
                     scrapeStatus,
+
                     product.product_price,
+
                     varProductPrice,
+
                     productId,
+
                     productCode,
+
                     cronName,
+
                     cmpid,
+
                     companyId
                 );
 
-                // Update database
-                try {
-                    await safeMongoUpdate(
-                        {
-                            collection: 'ept_product_details_new_vijaysales',
-                            cmpid
-                        },
-                        {
-                            [`${companyId}_product_id`]: productId,
-                            [`${companyId}_product_code`]: productCode
-                        },
-                        {
-                            $set: {
-                                product_price: varProductPrice,
-                                product_stock: varProductStock,
-                                product_image: varProductImage,
-                                product_review: varProductReview,
-                                product_rating: varProductRating,
-                                modified_date: modifiedDate,
-                                product_scrape_status: scrapeStatus,
-                                last_scrape_attempt: getCurrentIndTimeInfo('India_Railway_Date_Time')
-                            }
-                        }
-                    );
-                } catch (dbError) {
-                    console.error('Database update error:', dbError.message);
-                }
+                // -------------------------------------------------
+                // UPDATE MONGO
+                // -------------------------------------------------
 
-                const completedProgress = Math.round((currentProductNumber / ScrapingProductCount) * 100);
+                await executeMongoUpdate(
 
-                sendEvent('product_complete', {
-                    productNumber: currentProductNumber,
-                    totalProducts: ScrapingProductCount,
-                    processedProducts: currentProductNumber,
-                    progress: completedProgress,
-                    productId,
-                    productCode,
-                    status: scrapeStatus === 'completed' ? 'success' : 'pending',
-                    data: {
-                        product_ean_id: productId,
-                        product_code: productCode,
-                        product_price: varProductPrice,
-                        product_stock: varProductStock,
-                        modified_date: modifiedDate,
-                        scrape_status: scrapeStatus
+                    {
+                        collection:
+                            'ept_product_details_new_vijaysales',
+                        cmpid
                     },
-                    message: `Product ${currentProductNumber} completed`
-                });
+
+                    {
+                        [`${companyId}_product_id`]:
+                            productId,
+
+                        [`${companyId}_product_code`]:
+                            productCode
+                    },
+
+                    {
+                        $set: {
+
+                            product_price:
+                                varProductPrice,
+
+                            product_stock:
+                                varProductStock,
+
+                            product_image:
+                                varProductImage,
+
+                            modified_date:
+                                modifiedDate,
+
+                            product_scrape_status:
+                                scrapeStatus,
+
+                            product_review:
+                                varProductReview,
+
+                            product_rating:
+                                varProductRating
+                        }
+                    }
+                ); 
+
+                // -------------------------------------------------
+                // RESULT
+                // -------------------------------------------------
+
+                const scrapedItem = {
+
+                    product_ean_id:
+                        productId,
+
+                    product_code:
+                        productCode,
+
+                    product_price:
+                        varProductPrice,
+
+                    product_stock:
+                        varProductStock,
+                    
+                    product_review:
+                        varProductReview,
+                    
+                    product_rating:
+                        varProductRating,
+
+                    modified_date:
+                        modifiedDate
+                };
+
+                scrapedData.push(
+                    scrapedItem
+                );
+
+                productCount++;
+
+                // -------------------------------------------------
+                // PRODUCT SCRAPED EVENT
+                // -------------------------------------------------
+
+                sendSSE(
+                    'product_scraped',
+                    {
+
+                        ...scrapedItem,
+
+                        scrape_status:
+                            scrapeStatus,
+
+                        progress: {
+
+                            current:
+                                productCount,
+
+                            total:
+                                ScrapingProductCount,
+
+                            percentage:
+                                Math.round(
+                                    (
+                                        productCount /
+                                        ScrapingProductCount
+                                    ) * 100
+                                )
+                        }
+                    }
+                );
+
+                // -------------------------------------------------
+                // CRON UPDATE
+                // -------------------------------------------------
 
                 if (!isSingleProduct) {
-                    try {
-                        await updateEndTimeInDb(
-                            currentProductNumber,
-                            'running',
-                            cmpid,
-                            companyId,
-                            null,
-                            cronName,
-                            cronStartTime,
-                            ScrapingProductCount
-                        );
-                    } catch (dbError) {
-                        console.error('Error updating end time:', dbError.message);
-                    }
+
+                    await updateEndTimeInDb(
+
+                        productCount,
+
+                        'running',
+
+                        cmpid,
+
+                        companyId,
+
+                        null,
+
+                        cronName,
+
+                        cronStarttime,
+
+                        ScrapingProductCount
+                    );
                 }
+
+                // -------------------------------------------------
+                // SLEEP BEFORE NEXT PRODUCT
+                // -------------------------------------------------
 
             } catch (error) {
-                console.error(`Error scraping product ${productId}:`, error.message);
-                
-                // Retry logic
-                if (retryCount < CONFIG.MAX_PRODUCT_RETRIES) {
-                    console.log(`🔄 Retrying product ${productId}, attempt ${retryCount + 1} of ${CONFIG.MAX_PRODUCT_RETRIES}`);
-                    await delay(5000 * (retryCount + 1)); // Increasing delay
-                    
-                    // Close current page if exists
-                    if (page) {
-                        await closePage(page);
+
+                console.error(
+                    `Error scraping Vijaysales product ${productId}:`,
+                    error.message
+                );
+
+                // ---------------------------------------------
+                // PRODUCT ERROR
+                // ---------------------------------------------
+
+                sendSSE(
+                    'product_error',
+                    {
+
+                        product_id:
+                            productId,
+
+                        product_code:
+                            productCode,
+
+                        error:
+                            error.message
                     }
-                    
-                    // Recreate page for retry
-                    return await processSingleProduct(product, retryCount + 1);
-                }
-                
-                failedScrapes++;
+                );
 
-                sendEvent('product_error', {
-                    productNumber: currentProductNumber,
-                    totalProducts: ScrapingProductCount,
-                    productId,
-                    productCode,
-                    progress: Math.round((currentProductNumber / ScrapingProductCount) * 100),
-                    status: 'error',
-                    message: error.message || 'Error scraping product'
-                });
+                // ---------------------------------------------
+                // Do NOT stop entire scraper.
+                // Continue next product.
+                // ---------------------------------------------
 
-                try {
-                    await safeMongoUpdate(
-                        {
-                            collection: 'ept_product_details_new_vijaysales',
-                            cmpid
-                        },
-                        {
-                            [`${companyId}_product_id`]: productId,
-                            [`${companyId}_product_code`]: productCode
-                        },
-                        {
-                            $set: {
-                                product_scrape_status: 'pending',
-                                modified_date: getCurrentIndTimeInfo('India_Railway_Date_Time'),
-                                last_scrape_attempt: getCurrentIndTimeInfo('India_Railway_Date_Time')
-                            }
-                        }
-                    );
-                } catch (dbError) {
-                    console.error('Database update error:', dbError.message);
-                }
-            } finally {
-                // Close the page after each product
-                if (page) {
-                    await closePage(page);
-                }
-            }
-
-            await delay(CONFIG.DELAY_BETWEEN_PRODUCTS);
-        }
-
-        /*
-        ========================================================
-        PROCESS PRODUCTS WITH BROWSER RESTART
-        ========================================================
-        */
-
-        for (let i = 0; i < ArrGetProductInfo.length; i++) {
-            if (clientDisconnected || isShuttingDown) {
-                console.log('Stopping due to disconnect or shutdown');
-                break;
-            }
-
-            // Check if browser restart is needed
-            if (productsProcessed > 0 && productsProcessed % CONFIG.BROWSER_RESTART_AFTER === 0) {
-                console.log(`⚠️ Processed ${productsProcessed} products since last browser restart`);
-                await restartBrowser(true);
-            }
-
-            await processSingleProduct(ArrGetProductInfo[i]);
-            productsProcessed++;
-            
-            // Force garbage collection every 5 products
-            if (i % 5 === 0 && global.gc) {
-                global.gc();
-            }
-            
-            // Log progress every 50 products
-            if (i % 50 === 0 && i > 0) {
-                console.log(`📊 Progress: ${i + 1}/${ScrapingProductCount} products processed (${Math.round((i + 1) / ScrapingProductCount * 100)}%)`);
+                continue;
             }
         }
 
-        /*
-        ========================================================
-        FINAL CALCULATION
-        ========================================================
-        */
+        // ---------------------------------------------------------
+        // END TIME
+        // ---------------------------------------------------------
 
-        const endTime = new Date(`${getCurrentIndTimeInfo('India_Railway_Date_Only')}T${getCurrentIndTimeInfo('India_Railway_Time')}`);
-        const diffMs = endTime - startTime;
-        const totalMins = +(diffMs / 60000).toFixed(2);
+        const endTime =
+            new Date(
+                `${getCurrentIndTimeInfo(
+                    'India_Railway_Date_Only'
+                )}T${getCurrentIndTimeInfo(
+                    'India_Railway_Time'
+                )}`
+            );
+
+        const diffMs =
+            endTime - startTime;
+
+        const totalMins =
+            +(
+                diffMs / 60000
+            ).toFixed(2);
+
+        // ---------------------------------------------------------
+        // CRON END
+        // ---------------------------------------------------------
 
         if (!isSingleProduct) {
-            try {
-                await updateEndTimeInDb(
-                    productCount,
-                    'ending',
-                    cmpid,
-                    companyId,
-                    totalMins,
-                    cronName,
-                    cronStartTime,
-                    ScrapingProductCount
-                );
-            } catch (error) {
-                console.error('Error updating final status:', error.message);
-            }
+
+            await updateEndTimeInDb(
+
+                productCount,
+
+                'ending',
+
+                cmpid,
+
+                companyId,
+
+                totalMins,
+
+                cronName,
+
+                cronStarttime,
+
+                ScrapingProductCount
+            );
         }
 
-        sendEvent('complete', {
+        // ---------------------------------------------------------
+        // COMPLETE
+        // ---------------------------------------------------------
+
+        sendSSE('complete', {
+
             status: true,
-            message: 'Scraping completed',
-            totalProducts: ScrapingProductCount,
-            totalProcessed: productCount,
-            successfulScrapes: successfulScrapes,
-            failedScrapes: failedScrapes,
-            progress: 100,
-            totalMinutes: totalMins,
-            browserRestarts: browserRestartCount
+
+            message:
+                'Vijaysales scraping completed',
+
+            totalProcessed:
+                productCount,
+
+            totalProducts:
+                ScrapingProductCount,
+
+            totalMins,
+
+            data:
+                scrapedData
         });
 
-        res.end();
+        return res.end();
 
     } catch (error) {
-        console.error('Vijaysales scraper error:', error);
 
-        if (!res.writableEnded) {
-            try {
-                sendEvent('error', {
-                    status: false,
-                    message: error.message || 'Vijaysales scraping failed'
-                });
-                res.end();
-            } catch (e) {
-                console.error('Error sending error event:', e);
-            }
-        }
-    } finally {
-        clearInterval(memoryMonitor);
-        await gracefulShutdown();
+        console.error(
+            'Vijaysales scraper fatal error:',
+            error
+        );
+
+        sendSSE('error', {
+
+            status: false,
+
+            message:
+                error.message,
+
+            stack:
+                process.env.NODE_ENV === 'development'
+                    ? error.stack
+                    : undefined
+        });
+
+        return res.end();
     }
 }
 
