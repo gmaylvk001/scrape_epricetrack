@@ -5,7 +5,6 @@ require('dotenv').config({
     quiet: true
 });
 
-
 const {
     scrapeProduct
 } = require('./server');
@@ -83,8 +82,17 @@ const {
 } = require('./pittappillil');
 
 const {
-    executeMongoFind
-} = require('./mongo');
+    adishwarestoreScraper
+} = require('./adishwarestore');
+
+const {
+    paiinternationalScraper
+} = require('./paiinternational');
+
+const {
+    sangeethamobilesScraper
+} = require('./sangeetha_mobiles');
+
 
 
 const app = express();
@@ -246,6 +254,22 @@ app.get(
     '/pittappillil',
     pittappillilScraper
 );
+
+app.get(
+    '/adishwarestore',
+    adishwarestoreScraper
+);
+
+app.get(
+    '/paiinternational',
+    paiinternationalScraper
+);
+
+app.get(
+    '/sangeetha_mobiles',
+    sangeethamobilesScraper
+);
+
 
 
 /*
