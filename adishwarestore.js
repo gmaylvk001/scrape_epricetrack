@@ -17,10 +17,10 @@ const {
     updatePriceChangeData
 } = require('./utils/priceChange');
 
-const cronName = 'reliancedigital';
+const cronName = 'adishwarestore';
 
 /**
- * Reliance Digital scraper using HTTP/cURL-style requests.
+ * Adishware Store scraper using HTTP/cURL-style requests.
  *
  * No Puppeteer / Chrome browser is used.
  *
@@ -70,7 +70,7 @@ async function adishwarestoreScraper(req, res) {
         '(KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36';
 
     /**
-     * Request Reliance Digital product page.
+     * Request Adishware Store product page.
      *
      * This replaces:
      *
@@ -141,12 +141,12 @@ async function adishwarestoreScraper(req, res) {
 
             if (response.status < 200 || response.status >= 400) {
                 throw new Error(
-                    `Reliance Digital returned HTTP ${response.status}`
+                    `Adishware Store returned HTTP ${response.status}`
                 );
             }
 
             if (!response.data) {
-                throw new Error('Empty response from Reliance Digital');
+                throw new Error('Empty response from Adishware Store');
             }
 
             return response.data;
@@ -154,7 +154,7 @@ async function adishwarestoreScraper(req, res) {
         } catch (error) {
 
             console.error(
-                `Reliance Digital request failed (attempt ${attempt}/${maxAttempts}):`,
+                `Adishware Store request failed (attempt ${attempt}/${maxAttempts}):`,
                 error.message
             );
 
@@ -176,11 +176,11 @@ async function adishwarestoreScraper(req, res) {
     };
 
     // ---------------------------------------------------------
-    // PARSE Reliance digital PRODUCT HTML
+    // PARSE Adishware Store PRODUCT HTML
     // ---------------------------------------------------------
     
 
-    const parseRelianceProduct = (html) => {
+    const parseAdishwarestoreProduct = (html) => {
 
         const $ = cheerio.load(html);
 
@@ -192,120 +192,104 @@ async function adishwarestoreScraper(req, res) {
         let rating = 0;
 
         // =====================================================
-        // 1. PRODUCT JSON-LD SCHEMA
+        // CHECK PRODUCT PAGE
         // =====================================================
 
-        $('script[type="application/ld+json"]').each((i, el) => {
+        const isProductPage =
+            $('main#detailDiv').length > 0 ||
+            $('main.product-details-page').length > 0;
 
-            if (name && price) {
-                return;
-            }
-
-            const scriptText = $(el).html() || '';
-
-            if (!scriptText.trim()) {
-                return;
-            }
-
-            try {
-
-                const productData = JSON.parse(scriptText);
-
-                // Make sure this is a Product schema
-                if (
-                    productData?.['@type'] !== 'Product'
-                ) {
-                    return;
-                }
-
-                // =================================================
-                // PRODUCT NAME
-                // =================================================
-
-                name = productData?.name || '';
-
-                // =================================================
-                // PRICE
-                // =================================================
-
-                price =
-                    productData?.offers?.price ||
-                    '';
-
-                // =================================================
-                // AVAILABILITY
-                // =================================================
-
-                availability =
-                    productData?.offers?.availability ||
-                    '';
-
-                if (
-                    availability.includes('InStock')
-                ) {
-                    availability = 'In Stock';
-
-                } else if (
-                    availability.includes('OutOfStock')
-                ) {
-                    availability = 'Out Of Stock';
-                }
-
-                // =================================================
-                // IMAGE
-                // =================================================
-
-                image =
-                    productData?.image ||
-                    '';
-
-                // =================================================
-                // RATING
-                // =================================================
-
-                rating =
-                    parseFloat(
-                        productData?.aggregateRating?.ratingValue || 0
-                    ) || 0;
-
-                // =================================================
-                // REVIEW COUNT
-                // =================================================
-
-                review =
-                    parseInt(
-                        productData?.aggregateRating?.ratingCount || 0,
-                        10
-                    ) || 0;
-
-            } catch (error) {
-
-                console.error(
-                    'Reliance Digital JSON-LD parse error:',
-                    error.message
-                );
-
-            }
-
-        });
-
-
-        // =====================================================
-        // 2. IMAGE URL
-        // =====================================================
-
-        if (
-            image &&
-            !image.startsWith('http://') &&
-            !image.startsWith('https://')
-        ) {
-            image =
-                `https://www.reliancedigital.in${image}`;
+        if (!isProductPage) {
+            return {
+                name,
+                price,
+                availability,
+                image,
+                review,
+                rating
+            };
         }
 
+        // =====================================================
+        // PRODUCT NAME
+        // =====================================================
+
+        name = $('h2.woo_pr_title span').first().text().trim();
 
         // =====================================================
-        // 3. RETURN PRODUCT DATA
+        // PRODUCT IMAGE
+        // Original PHP:
+        // div[class=pt-1] div -> data-img
+        // =====================================================
+
+        image = $('div.pt-1 div')
+            .first()
+            .attr('data-img') || '';
+
+        // =====================================================
+        // STOCK STATUS
+        // Original PHP:
+        // button[class=addToCartButton]
+        // =====================================================
+
+        const stockStatus = $('button.addToCartButton')
+            .first()
+            .text()
+            .replace(/\s+/g, '')
+            .trim();
+
+        // =====================================================
+        // PRICE + STOCK
+        // =====================================================
+
+        if (stockStatus === 'OutOfStock') {
+
+            price = '';
+            availability = 'Out Of Stock';
+
+        } else if (stockStatus === 'AddToCart') {
+
+            const rawPrice = $('div.pt-1 div')
+                .first()
+                .attr('data-price') || '';
+
+            price = parseFloat(
+                rawPrice.replace(/[^0-9.]/g, '')
+            ) || 0;
+
+            availability = 'In stock';
+
+        } else {
+
+            price = '';
+            availability = '';
+            image = '';
+        }
+
+        // =====================================================
+        // REVIEWS / RATING
+        // =====================================================
+
+        const reviewText = $('div.bv_numReviews_text')
+            .first()
+            .text()
+            .trim();
+
+        if (reviewText) {
+            review = parseInt(reviewText.replace(/\D/g, '')) || 0;
+        }
+
+        const ratingText = $('div.bv_avgRating_component_container')
+            .first()
+            .text()
+            .trim();
+
+        if (ratingText) {
+            rating = parseFloat(ratingText.replace(/[^0-9.]/g, '')) || 0;
+        }
+
+        // =====================================================
+        // RETURN
         // =====================================================
 
         return {
@@ -351,7 +335,7 @@ async function adishwarestoreScraper(req, res) {
 
         sendSSE('start', {
             status: true,
-            message: 'Reliance DIgital scraping started',
+            message: 'Adishware Store scraping started',
             cmpid,
             companyId,
             isSingleProduct
@@ -409,7 +393,7 @@ async function adishwarestoreScraper(req, res) {
         const products = await executeMongoFind(
             {
                 collection:
-                    'ept_product_details_new_reliancedigital',
+                    'ept_product_details_new_adishwarestore',
                 cmpid
             },
             filter,
@@ -530,7 +514,7 @@ async function adishwarestoreScraper(req, res) {
             if (
                 !productUrl
                     .toLowerCase()
-                    .startsWith('https://www.reliancedigital.in/product')
+                    .startsWith('https://www.adishwarestore.com/')
             ) {
                 return;
             }
@@ -681,12 +665,12 @@ async function adishwarestoreScraper(req, res) {
                 continue;
             }
 
-            if (!hostname.includes('reliancedigital.in')) {
+            if (!hostname.includes('adishwarestore.com')) {
 
                 sendSSE('warning', {
 
                     message:
-                        'Only Reliance Digital URLs supported',
+                        'Only Adishware Store URLs supported',
 
                     url:
                         productUrl
@@ -753,7 +737,7 @@ async function adishwarestoreScraper(req, res) {
                 // -------------------------------------------------
 
                 const result =
-                    parseRelianceProduct(html);
+                    parseAdishwarestoreProduct(html);
 
                 // -------------------------------------------------
                 // PRODUCT NOT FOUND
@@ -937,7 +921,7 @@ async function adishwarestoreScraper(req, res) {
 
                     {
                         collection:
-                            'ept_product_details_new_reliancedigital',
+                            'ept_product_details_new_adishwarestore',
                         cmpid
                     },
 
@@ -1071,7 +1055,7 @@ async function adishwarestoreScraper(req, res) {
             } catch (error) {
 
                 console.error(
-                    `Error scraping Reliance Digital product ${productId}:`,
+                    `Error scraping Adishware Store product ${productId}:`,
                     error.message
                 );
 
@@ -1159,7 +1143,7 @@ async function adishwarestoreScraper(req, res) {
             status: true,
 
             message:
-                'Reliance DIgital scraping completed',
+                'Adishware Store scraping completed',
 
             totalProcessed:
                 productCount,
@@ -1178,7 +1162,7 @@ async function adishwarestoreScraper(req, res) {
     } catch (error) {
 
         console.error(
-            'Reliance Digital scraper fatal error:',
+            'Adishware Store scraper fatal error:',
             error
         );
 

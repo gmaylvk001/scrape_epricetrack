@@ -1,5 +1,4 @@
 const axios = require('axios');
-const cheerio = require('cheerio');
 
 const {
     executeMongoFind,
@@ -16,17 +15,10 @@ const {
 const {
     updatePriceChangeData
 } = require('./utils/priceChange');
+const { getStorePincode } = require('./utils/pinCode');
 
-const cronName = 'reliancedigital';
+const cronName = 'paiinternational';
 
-/**
- * Reliance Digital scraper using HTTP/cURL-style requests.
- *
- * No Puppeteer / Chrome browser is used.
- *
- * Required:
- * npm install axios cheerio
- */
 
 async function paiinternationalScraper(req, res) {
 
@@ -69,120 +61,12 @@ async function paiinternationalScraper(req, res) {
         'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 ' +
         '(KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36';
 
-    /**
-     * Request Reliance Digital product page.
-     *
-     * This replaces:
-     *
-     * await page.goto(productUrl, {
-     *     waitUntil: 'networkidle2',
-     *     timeout: 50000
-     * });
-     */
-    const fetchProductPage = async (url, attempt = 1) => {
-
-        const maxAttempts = 3;
-
-        try {
-
-            const response = await axios.get(url, {
-                timeout: 30000,
-
-                maxRedirects: 5,
-
-                // Do not throw for normal HTTP responses.
-                validateStatus: (status) => {
-                    return status >= 200 && status < 500;
-                },
-
-                headers: {
-                    'User-Agent': USER_AGENT,
-
-                    'Accept':
-                        'text/html,application/xhtml+xml,application/xml;q=0.9,' +
-                        'image/avif,image/webp,*/*;q=0.8',
-
-                    'Accept-Language':
-                        'en-IN,en;q=0.9,en-US;q=0.8',
-
-                    'Accept-Encoding':
-                        'gzip, deflate, br',
-
-                    'Cache-Control':
-                        'no-cache',
-
-                    'Pragma':
-                        'no-cache',
-
-                    'Upgrade-Insecure-Requests':
-                        '1',
-
-                    'Sec-Fetch-Dest':
-                        'document',
-
-                    'Sec-Fetch-Mode':
-                        'navigate',
-
-                    'Sec-Fetch-Site':
-                        'none',
-
-                    'Sec-Fetch-User':
-                        '?1',
-
-                    'Connection':
-                        'keep-alive'
-                },
-
-                // Prevent axios from converting response unexpectedly.
-                responseType: 'text',
-
-                decompress: true
-            });
-
-            if (response.status < 200 || response.status >= 400) {
-                throw new Error(
-                    `Reliance Digital returned HTTP ${response.status}`
-                );
-            }
-
-            if (!response.data) {
-                throw new Error('Empty response from Reliance Digital');
-            }
-
-            return response.data;
-
-        } catch (error) {
-
-            console.error(
-                `Reliance Digital request failed (attempt ${attempt}/${maxAttempts}):`,
-                error.message
-            );
-
-            if (attempt < maxAttempts) {
-
-                // Small retry delay
-                await new Promise(resolve =>
-                    setTimeout(resolve, 1500 * attempt)
-                );
-
-                return fetchProductPage(
-                    url,
-                    attempt + 1
-                );
-            }
-
-            throw error;
-        }
-    };
 
     // ---------------------------------------------------------
-    // PARSE Reliance digital PRODUCT HTML
+    // PARSE Paiinternational PRODUCT HTML
     // ---------------------------------------------------------
     
-
-    const parseRelianceProduct = (html) => {
-
-        const $ = cheerio.load(html);
+    const parsePaiinternationalProduct = async (productUrl, pincode) => {
 
         let name = '';
         let price = '';
@@ -191,133 +75,165 @@ async function paiinternationalScraper(req, res) {
         let review = 0;
         let rating = 0;
 
-        // =====================================================
-        // 1. PRODUCT JSON-LD SCHEMA
-        // =====================================================
+        try {
 
-        $('script[type="application/ld+json"]').each((i, el) => {
+            // =====================================================
+            // 1. PRODUCT API
+            // =====================================================
 
-            if (name && price) {
-                return;
-            }
+            const productApiUrl = productUrl.replace(
+                'product-details',
+                'api/product-detail'
+            );
 
-            const scriptText = $(el).html() || '';
-
-            if (!scriptText.trim()) {
-                return;
-            }
-
-            try {
-
-                const productData = JSON.parse(scriptText);
-
-                // Make sure this is a Product schema
-                if (
-                    productData?.['@type'] !== 'Product'
-                ) {
-                    return;
+            const productResponse = await axios.get(productApiUrl, {
+                timeout: 30000,
+                headers: {
+                    'User-Agent': USER_AGENT,
+                    'Accept': 'application/json'
                 }
+            });
 
-                // =================================================
-                // PRODUCT NAME
-                // =================================================
+            const productData = productResponse.data?.data;
 
-                name = productData?.name || '';
-
-                // =================================================
-                // PRICE
-                // =================================================
-
-                price =
-                    productData?.offers?.price ||
-                    '';
-
-                // =================================================
-                // AVAILABILITY
-                // =================================================
-
-                availability =
-                    productData?.offers?.availability ||
-                    '';
-
-                if (
-                    availability.includes('InStock')
-                ) {
-                    availability = 'In Stock';
-
-                } else if (
-                    availability.includes('OutOfStock')
-                ) {
-                    availability = 'Out Of Stock';
-                }
-
-                // =================================================
-                // IMAGE
-                // =================================================
-
-                image =
-                    productData?.image ||
-                    '';
-
-                // =================================================
-                // RATING
-                // =================================================
-
-                rating =
-                    parseFloat(
-                        productData?.aggregateRating?.ratingValue || 0
-                    ) || 0;
-
-                // =================================================
-                // REVIEW COUNT
-                // =================================================
-
-                review =
-                    parseInt(
-                        productData?.aggregateRating?.ratingCount || 0,
-                        10
-                    ) || 0;
-
-            } catch (error) {
-
-                console.error(
-                    'Reliance Digital JSON-LD parse error:',
-                    error.message
-                );
-
+            if (!productData) {
+                return {
+                    name,
+                    price,
+                    availability,
+                    image,
+                    review,
+                    rating,
+                };
             }
 
-        });
+            // =====================================================
+            // 2. PRODUCT DETAILS
+            // =====================================================
 
+            name = productData.title || '';
+            
+            const productSlug = productData.slug || '';
+            const productId = productData.id || '';
 
-        // =====================================================
-        // 2. IMAGE URL
-        // =====================================================
+            image = productData.images?.[0]?.image || '';
 
-        if (
-            image &&
-            !image.startsWith('http://') &&
-            !image.startsWith('https://')
-        ) {
-            image =
-                `https://www.reliancedigital.in${image}`;
+            // =====================================================
+            // 3. CHECK PINCODE / STOCK
+            // =====================================================
+
+            const stockRequestUrl =
+                'https://www.paiinternational.in/api/v1/get_product_eta_pincode/';
+
+            const stockResponse = await axios.post(
+                stockRequestUrl,
+                {
+                    pincode: pincode,
+                    product_slug: productSlug
+                },
+                {
+                    timeout: 30000,
+                    headers: {
+                        'User-Agent': USER_AGENT,
+                        'Accept': 'application/json'
+                    }
+                }
+            );
+
+            const stockData = stockResponse.data;
+
+            // =====================================================
+            // 4. CHECK STOCK
+            // =====================================================
+
+            if (
+                stockData?.status !== true &&
+                stockData?.message ===
+                    'The product is currently unavailable for delivery'
+            ) {
+                price = '';
+                availability = 'Out Of Stock';
+
+                return {
+                    name,
+                    price,
+                    availability,
+                    image,
+                    review,
+                    rating,
+                };
+            }
+
+            // =====================================================
+            // 5. GET STATE PRICE
+            // =====================================================
+
+            const stateId = 2;
+
+            const priceRequestUrl =
+                'https://www.paiinternational.in/api/v1/get_state_price_api/';
+
+            const priceResponse = await axios.post(
+                priceRequestUrl,
+                {
+                    product_id: productId,
+                    state_id: stateId
+                },
+                {
+                    timeout: 30000,
+                    headers: {
+                        'User-Agent': USER_AGENT,
+                        'Accept': 'application/json'
+                    }
+                }
+            );
+
+            const priceData = priceResponse.data;
+
+            // =====================================================
+            // 6. GET PRICE
+            // =====================================================
+
+            price = parseFloat(
+                priceData?.data?.price
+            ) || 0;
+
+            // =====================================================
+            // 7. STOCK STATUS
+            // =====================================================
+
+            availability = 'In stock';
+
+            // =====================================================
+            // 9. RETURN PRODUCT DATA
+            // =====================================================
+
+            return {
+                name,
+                price,
+                availability,
+                image,
+                review,
+                rating,
+            };
+
+        } catch (error) {
+
+            console.error(
+                'PAI International scraping error:',
+                error.message
+            );
+
+            return {
+                name,
+                price,
+                availability,
+                image,
+                review,
+                rating,
+            };
         }
-
-
-        // =====================================================
-        // 3. RETURN PRODUCT DATA
-        // =====================================================
-
-        return {
-            name,
-            price,
-            availability,
-            image,
-            review,
-            rating
-        };
     };
-
 
     // ---------------------------------------------------------
     // MAIN
@@ -351,7 +267,7 @@ async function paiinternationalScraper(req, res) {
 
         sendSSE('start', {
             status: true,
-            message: 'Reliance DIgital scraping started',
+            message: 'Paiinternational scraping started',
             cmpid,
             companyId,
             isSingleProduct
@@ -409,7 +325,7 @@ async function paiinternationalScraper(req, res) {
         const products = await executeMongoFind(
             {
                 collection:
-                    'ept_product_details_new_reliancedigital',
+                    'ept_product_details_new_paiinternational',
                 cmpid
             },
             filter,
@@ -530,7 +446,7 @@ async function paiinternationalScraper(req, res) {
             if (
                 !productUrl
                     .toLowerCase()
-                    .startsWith('https://www.reliancedigital.in/product')
+                    .startsWith('https://www.paiinternational.in/product-details/')
             ) {
                 return;
             }
@@ -681,12 +597,12 @@ async function paiinternationalScraper(req, res) {
                 continue;
             }
 
-            if (!hostname.includes('reliancedigital.in')) {
+            if (!hostname.includes('paiinternational.in')) {
 
                 sendSSE('warning', {
 
                     message:
-                        'Only Reliance Digital URLs supported',
+                        'Only Paiinternational URLs supported',
 
                     url:
                         productUrl
@@ -737,23 +653,19 @@ async function paiinternationalScraper(req, res) {
                     status:
                         'scraping'
                 });
-
-                // -------------------------------------------------
-                // HTTP REQUEST
-                // -------------------------------------------------
-
-                const html =
-                    await fetchProductPage(
-                        productUrl
-                    );
             
 
                 // -------------------------------------------------
                 // PARSE HTML
                 // -------------------------------------------------
 
+                let pincode = await getStorePincode(companyId);
+                if (pincode === null || !pincode) {
+                    pincode = req.query.pincode || 600018;
+                }
+
                 const result =
-                    parseRelianceProduct(html);
+                    await parsePaiinternationalProduct(productUrl, pincode);
 
                 // -------------------------------------------------
                 // PRODUCT NOT FOUND
@@ -937,7 +849,7 @@ async function paiinternationalScraper(req, res) {
 
                     {
                         collection:
-                            'ept_product_details_new_reliancedigital',
+                            'ept_product_details_new_paiinternational',
                         cmpid
                     },
 
@@ -1071,7 +983,7 @@ async function paiinternationalScraper(req, res) {
             } catch (error) {
 
                 console.error(
-                    `Error scraping Reliance Digital product ${productId}:`,
+                    `Error scraping Paiinternational product ${productId}:`,
                     error.message
                 );
 
@@ -1159,7 +1071,7 @@ async function paiinternationalScraper(req, res) {
             status: true,
 
             message:
-                'Reliance DIgital scraping completed',
+                'paiinternational scraping completed',
 
             totalProcessed:
                 productCount,
@@ -1178,7 +1090,7 @@ async function paiinternationalScraper(req, res) {
     } catch (error) {
 
         console.error(
-            'Reliance Digital scraper fatal error:',
+            'Paiinternational scraper fatal error:',
             error
         );
 
