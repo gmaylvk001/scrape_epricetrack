@@ -15,7 +15,7 @@ const { getStorePincode } = require('./utils/pinCode');
 
 const { updatePriceChangeData } = require('./utils/priceChange');
 
-const CRON_NAME = 'sangeethamobiles';
+const CRON_NAME = 'sangeetha_mobiles';
 const USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36';
 
 /**
