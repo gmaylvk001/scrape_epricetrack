@@ -1,95 +1,241 @@
-const puppeteer = require('puppeteer');
-const { getCurrentIndTimeInfo, updateStartTimeInDb, updateEndTimeInDb } = require('./utils/cronTime');
-const { executeMongoFind, executeMongoCount, executeMongoUpdate } = require('./mongo');
-const { updatePriceChangeData } = require('./utils/priceChange');
+const axios = require('axios');
+const cheerio = require('cheerio');
+
+const {
+    executeMongoFind,
+    executeMongoCount,
+    executeMongoUpdate
+} = require('./mongo');
+
+const {
+    getCurrentIndTimeInfo,
+    updateStartTimeInDb,
+    updateEndTimeInDb
+} = require('./utils/cronTime');
+
+const {
+    updatePriceChangeData
+} = require('./utils/priceChange');
 
 const cronName = 'poorvika';
 
+/**
+ * poorvika scraper using HTTP/cURL-style requests.
+ *
+ * No Puppeteer / Chrome browser is used.
+ *
+ * Required:
+ * npm install axios cheerio
+ */
+
 async function poorvikaScraper(req, res) {
 
-    const delay = (ms) => new Promise(resolve => setTimeout(resolve, ms));
-
-    let browser;
-
-    /*
-    |--------------------------------------------------------------------------
-    | SSE SETUP
-    |--------------------------------------------------------------------------
-    */
+    // ---------------------------------------------------------
+    // SSE SETUP
+    // ---------------------------------------------------------
 
     res.setHeader('Content-Type', 'text/event-stream');
     res.setHeader('Cache-Control', 'no-cache');
     res.setHeader('Connection', 'keep-alive');
     res.setHeader('X-Accel-Buffering', 'no');
 
-    if (res.flushHeaders) {
+    // Flush headers immediately
+    if (typeof res.flushHeaders === 'function') {
         res.flushHeaders();
     }
 
-    const sendSSE = (event, data) => {
+    const sendSSE = (type, data) => {
         try {
-            res.write(`event: ${event}\n`);
+            if (res.writableEnded || res.destroyed) {
+                return;
+            }
+
+            res.write(`event: ${type}\n`);
             res.write(`data: ${JSON.stringify(data)}\n\n`);
+
+            if (typeof res.flush === 'function') {
+                res.flush();
+            }
         } catch (error) {
             console.error('SSE send error:', error.message);
         }
     };
 
-    try {
+    // ---------------------------------------------------------
+    // CURL / HTTP CONFIG
+    // ---------------------------------------------------------
 
-        sendSSE('start', {
-            status: true,
-            message: 'Poorvika scraper started',
-            cronName
-        });
+    const USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 ' + '(KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36';
 
-        /*
-        |--------------------------------------------------------------------------
-        | BROWSER
-        |--------------------------------------------------------------------------
-        */
+    /**
+     * Request poorvika product page.
+     *
+     * This replaces:
+     *
+     * await page.goto(productUrl, {
+     *     waitUntil: 'networkidle2',
+     *     timeout: 50000
+     * });
+     */
+    const fetchProductPage = async (url, attempt = 1) => {
 
-        sendSSE('step', {
-            status: true,
-            step: 'browser_launch',
-            message: 'Launching browser...'
-        });
+        const maxAttempts = 3;
 
-        browser = await puppeteer.launch({
-            headless: 'new',
-            args: [
-                '--no-sandbox',
-                '--disable-setuid-sandbox',
-                '--disable-dev-shm-usage',
-                '--disable-gpu',
-                '--disable-extensions',
-                '--disable-background-networking',
-                '--disable-background-timer-throttling',
-                '--disable-renderer-backgrounding',
-                '--no-first-run',
-                '--no-default-browser-check'
-            ]
-        });
+        try {
 
-        sendSSE('step', {
-            status: true,
-            step: 'browser_ready',
-            message: 'Browser launched successfully'
-        });
+            const response = await axios.get(url, {
+                timeout: 30000,
 
-        /*
-            await page.authenticate({
-                username: 'eqenhyym',
-                password: 'qsfp3x1obv71'
+                maxRedirects: 5,
+
+                // Do not throw for normal HTTP responses.
+                validateStatus: (status) => {
+                    return status >= 200 && status < 500;
+                },
+
+                headers: {
+                    'User-Agent': USER_AGENT,
+
+                    'Accept':
+                        'text/html,application/xhtml+xml,application/xml;q=0.9,' +
+                        'image/avif,image/webp,*/*;q=0.8',
+
+                    'Accept-Language':
+                        'en-IN,en;q=0.9,en-US;q=0.8',
+
+                    'Accept-Encoding':
+                        'gzip, deflate, br',
+
+                    'Cache-Control':
+                        'no-cache',
+
+                    'Pragma':
+                        'no-cache',
+
+                    'Upgrade-Insecure-Requests':
+                        '1',
+
+                    'Sec-Fetch-Dest':
+                        'document',
+
+                    'Sec-Fetch-Mode':
+                        'navigate',
+
+                    'Sec-Fetch-Site':
+                        'none',
+
+                    'Sec-Fetch-User':
+                        '?1',
+
+                    'Connection':
+                        'keep-alive'
+                },
+
+                // Prevent axios from converting response unexpectedly.
+                responseType: 'text',
+
+                decompress: true
             });
-        */
+
+            if (response.status < 200 || response.status >= 400) {
+                throw new Error(
+                    `poorvika returned HTTP ${response.status}`
+                );
+            }
+
+            if (!response.data) {
+                throw new Error('Empty response from my');
+            }
+
+            return response.data;
+
+        } catch (error) {
+
+            console.error(
+                `poorvika request failed with 404 page`,
+                error.message
+            );
+
+            throw error;
+        }
+    };
+
+    // ---------------------------------------------------------
+    // PARSE poorvika PRODUCT HTML
+    // ---------------------------------------------------------
+    
+
+    const parsePoorvikaProduct = (html) => {
+
+        const $ = cheerio.load(html);
+
+        let name = '';
+        let price = '';
+        let availability = '';
+        let image = '';
+        let review = 0;
+        let rating = 0;
+
+        // =====================================================
+        // 1. PRODUCT NAME
+        // =====================================================
+
+        if($('.main-detail_product_container__bFKim')){
+
+            const nextDataElement = $('#__NEXT_DATA__');
+
+            try {
+                const data = JSON.parse(nextDataElement.text().trim());
+
+                const pimData = data?.props?.pageProps?.pimData;
+
+                name = pimData.name || '';
+
+                // IMAGE
+                image = pimData?.image?.url || '';
+                
+                price = pimData?.prices?.[0]?.sp?.[0]?.price || '';;
+
+                availability = data?.props?.pageProps?.additionalData?.stock || 0;
+
+                review = pimData.aggregateRating?.reviewCount || 0;
+                rating = pimData.aggregateRating?.ratingValue || 0;
+            } catch(error) {
+                console.log(
+                    'Invalid JSON-LD:',
+                    error.message
+                );
+            }
+
+            if (!price > 0) {
+                price = 'No Result';
+                availability = 'Out Of Stock';
+            }
+
+            return {
+                name,
+                price,
+                availability,
+                image,
+                review,
+                rating
+            };
+        }else{
+            return null;
+        }
+    };
+
+    // ---------------------------------------------------------
+    // MAIN
+    // ---------------------------------------------------------
+
+    try {
 
         const cmpid = req.query.cmpid;
 
         if (!cmpid) {
 
             sendSSE('error', {
-                status: false,
                 message: 'cmpid is required'
             });
 
@@ -101,383 +247,488 @@ async function poorvikaScraper(req, res) {
         const ean = req.query.ean;
         const itemcode = req.query.itemcode;
 
+        const isSingleProduct = !!(ean && itemcode);
+
+        // -----------------------------------------------------
+        // START
+        // -----------------------------------------------------
+
+        sendSSE('start', {
+            status: true,
+            message: 'poorvika scraping started',
+            cmpid,
+            companyId,
+            isSingleProduct
+        });
+
+        // -----------------------------------------------------
+        // FILTER
+        // -----------------------------------------------------
+
         const filter = {
             status: 'active',
-            product_scrape_status: { $in: ['pending', 'completed'] },
-            product_url: { $nin: ['', null, 'No Result'] }
+            product_scrape_status: {
+                $in: [
+                    'pending',
+                    'completed'
+                ]
+            },
+            product_url: {
+                $nin: [
+                    '',
+                    null,
+                    'No Result'
+                ]
+            }
         };
 
-        const isSingleProduct = !!(ean && itemcode);
+        // -----------------------------------------------------
+        // SINGLE PRODUCT
+        // -----------------------------------------------------
 
         if (isSingleProduct) {
             filter[`${companyId}_product_id`] = ean;
             filter[`${companyId}_product_code`] = itemcode;
         }
 
+        // -----------------------------------------------------
+        // FETCH PRODUCTS
+        // -----------------------------------------------------
+
         sendSSE('step', {
-            status: true,
-            step: 'fetch_products',
-            message: 'Fetching Poorvika products...'
+            step: 'products',
+            status: 'running',
+            message: 'Fetching products from database...'
         });
 
         const products = await executeMongoFind(
             {
-                collection: 'ept_product_details_new_poorvika',
+                collection:
+                    'ept_product_details_new_poorvika',
                 cmpid
             },
             filter,
-            { _id: 0 }
+            {
+                _id: 0
+            }
         );
 
-        if (products.length > 0) {
+        // -----------------------------------------------------
+        // NO PRODUCTS
+        // -----------------------------------------------------
 
-            sendSSE('step', {
+        if (!products || products.length === 0) {
+
+            sendSSE('complete', {
                 status: true,
-                step: 'fetch_existing_products',
-                message: 'Fetching existing products...'
+                message: 'Products Not Found',
+                totalProcessed: 0,
+                data: []
             });
 
-            const existingProducts = await executeMongoFind(
+            return res.end();
+        }
+
+        sendSSE('products_found', {
+            message: `Found ${products.length} products in source collection`,
+            count: products.length
+        });
+
+        // -----------------------------------------------------
+        // FETCH EXISTING PRODUCTS
+        // -----------------------------------------------------
+
+        sendSSE('step', {
+            step: 'matching',
+            status: 'running',
+            message: 'Matching products with main product collection...'
+        });
+
+        const existingProducts =
+            await executeMongoFind(
                 {
-                    collection: 'ept_product_details_new',
+                    collection:
+                        'ept_product_details_new',
                     cmpid
                 },
                 {
                     $and: [
-                        { status: 'active' },
-                        { ean_product_data_details_scrap_status: 'completed' }
+                        {
+                            status: 'active'
+                        },
+                        {
+                            ean_product_data_details_scrap_status:
+                                'completed'
+                        }
                     ]
                 },
-                { _id: 0, product_ean_id: 1, product_code: 1 }
+                {
+                    _id: 0,
+                    product_ean_id: 1,
+                    product_code: 1
+                }
             );
 
-            const productMap = new Set();
+        // -----------------------------------------------------
+        // CREATE PRODUCT MAP
+        // -----------------------------------------------------
 
-            existingProducts.forEach((row) => {
+        const productMap = new Set();
+
+        if (Array.isArray(existingProducts)) {
+
+            existingProducts.forEach(row => {
                 const key = `${row.product_ean_id}_${row.product_code}`;
+
                 productMap.add(key);
             });
+        }
 
-            // Filter matching products
-            const ArrGetProductInfo = [];
+        // -----------------------------------------------------
+        // FILTER PRODUCTS
+        // -----------------------------------------------------
 
-            products.forEach((arrTmp) => {
+        const ArrGetProductInfo = [];
 
-                const key =
-                    `${arrTmp[`${companyId}_product_id`]}_${arrTmp[`${companyId}_product_code`]}`;
+        products.forEach(product => {
 
-                if (
-                    productMap.has(key) &&
-                    arrTmp['product_url'].includes('https://www.poorvika.com/')
-                ) {
-                    ArrGetProductInfo.push(arrTmp);
-                }
+            const productId = product[`${companyId}_product_id`];
 
+            const productCode = product[`${companyId}_product_code`];
+
+            const productUrl = product.product_url;
+
+            if (!productUrl) {
+                return;
+            }
+
+            const key = `${productId}_${productCode}`;
+
+            // Only matching main products
+            if (!productMap.has(key)) {
+                return;
+            }
+
+            // Only poorvika URLs
+            if (!productUrl.toLowerCase().startsWith('https://www.poorvika.com/')) {
+                return;
+            }
+
+            ArrGetProductInfo.push(product);
+        });
+
+        // -----------------------------------------------------
+        // NO MATCHING PRODUCTS
+        // -----------------------------------------------------
+
+        if (ArrGetProductInfo.length === 0) {
+
+            sendSSE('complete', {
+                status: true,
+                message: 'Active Products Not Found',
+                totalProcessed: 0,
+                data: []
             });
 
-            if (ArrGetProductInfo.length > 0) {
+            return res.end();
+        }
 
-                let productCount = 0;
+        sendSSE('filtered_products', {
+            message:
+                `Found ${ArrGetProductInfo.length} products to scrape`,
+            count:
+                ArrGetProductInfo.length
+        });
 
-                const startTime = new Date(
-                    `${getCurrentIndTimeInfo('India_Railway_Date_Only')}T${getCurrentIndTimeInfo('India_Railway_Time')}`
-                );
+        // -----------------------------------------------------
+        // SCRAPING COUNT
+        // -----------------------------------------------------
 
-                const cronStartTime = getCurrentIndTimeInfo();
+        const ScrapingProductCount = ArrGetProductInfo.length;
 
-                const ScrapingProductCount = ArrGetProductInfo.length;
+        const startTime = new Date(`${getCurrentIndTimeInfo('India_Railway_Date_Only')}T${getCurrentIndTimeInfo('India_Railway_Time')}`);
 
-                if (!isSingleProduct) {
+        const cronStarttime = getCurrentIndTimeInfo();
 
-                    await updateStartTimeInDb(
-                        cmpid,
-                        companyId,
-                        cronName,
-                        ScrapingProductCount
-                    );
+        // -----------------------------------------------------
+        // CRON START
+        // -----------------------------------------------------
 
-                }
+        if (!isSingleProduct) {
+            await updateStartTimeInDb(
+                cmpid,
+                companyId,
+                cronName,
+                ScrapingProductCount
+            );
+        }
 
-                const scrapedData = [];
+        let productCount = 0;
 
-                /*
-                |--------------------------------------------------------------------------
-                | TOTAL PRODUCT EVENT
-                |--------------------------------------------------------------------------
-                */
+        const scrapedData = [];
 
-                sendSSE('step', {
-                    status: true,
-                    step: 'products_ready',
-                    message: 'Products ready for scraping',
-                    totalProducts: ScrapingProductCount,
-                    isSingleProduct
+        // -----------------------------------------------------
+        // PRODUCT LOOP
+        // -----------------------------------------------------
+
+        for (const product of ArrGetProductInfo) {
+            const productId = product[`${companyId}_product_id`];
+
+            const productCode = product[`${companyId}_product_code`];
+
+            const productUrl = product.product_url;
+
+            // -------------------------------------------------
+            // PROGRESS
+            // -------------------------------------------------
+
+            sendSSE('progress', {
+                current: productCount + 1,
+                total: ScrapingProductCount,
+                product_id: productId,
+                product_code: productCode,
+                url: productUrl,
+                percentage: Math.round(((productCount + 1) / ScrapingProductCount) * 100)
+            });
+
+            // -------------------------------------------------
+            // URL VALIDATION
+            // -------------------------------------------------
+
+            let hostname;
+
+            try {
+                hostname = new URL(productUrl).hostname.toLowerCase();
+            } catch (error) {
+                sendSSE('product_error', {
+                    product_id: productId,
+                    product_code: productCode,
+                    error: 'Invalid product URL'
+                });
+                continue;
+            }
+
+            if (!hostname.includes('poorvika.com')) {
+                sendSSE('warning', {
+                    message: 'Only poorvika URLs supported',
+                    url: productUrl
                 });
 
-                /*
-                |--------------------------------------------------------------------------
-                | PRODUCT SCRAPING
-                |--------------------------------------------------------------------------
-                */
+                continue;
+            }
 
-                for (const product of ArrGetProductInfo) {
+            // -------------------------------------------------
+            // DEFAULT VALUES
+            // -------------------------------------------------
 
-                    const productUrl = product.product_url;
-                    const hostname = new URL(productUrl).hostname;
+            let varProductPrice = 'No Result';
+            let varProductStock = 'No Result';
+            let varProductImage = 'No Result';
+            let varProductReview = 'No Result';
+            let varProductRating = 'No Result';
+            let scrapeStatus = 'pending';
 
-                    if (!hostname.includes('poorvika')) {
+            // -------------------------------------------------
+            // SCRAPE
+            // -------------------------------------------------
 
-                        sendSSE('error', {
-                            status: false,
-                            message: 'Only poorvika URLs supported',
-                            productUrl
-                        });
+            try {
+                sendSSE('product_start', {
+                    product_id: productId,
+                    product_code: productCode,
+                    url: productUrl,
+                    status: 'scraping'
+                });
 
-                        continue;
-                    }
+                // -------------------------------------------------
+                // HTTP REQUEST
+                // -------------------------------------------------
 
-                    const currentProductNumber = productCount + 1;
+                const html = await fetchProductPage(productUrl);
 
-                    sendSSE('product_start', {
-                        status: true,
-                        productNumber: currentProductNumber,
-                        totalProducts: ScrapingProductCount,
-                        progress: Number(
-                            (((currentProductNumber - 1) / ScrapingProductCount) * 100).toFixed(2)
-                        ),
-                        productId: product[`${companyId}_product_id`],
-                        productCode: product[`${companyId}_product_code`],
-                        productUrl
+                // -------------------------------------------------
+                // PARSE HTML
+                // -------------------------------------------------
+
+                const result =
+                    parsePoorvikaProduct(html);
+
+                console.log(result);
+
+                // -------------------------------------------------
+                // PRODUCT NOT FOUND
+                // -------------------------------------------------
+
+                if (result === null) {
+
+                    varProductPrice =
+                        'No Result';
+
+                    varProductStock =
+                        'No Result';
+
+                    varProductImage =
+                        'No Result';
+
+                    varProductReview =
+                        'No Result';
+
+                    varProductRating =
+                        'No Result';
+
+                    scrapeStatus =
+                        'pending';
+
+                    sendSSE('product_failed', {
+
+                        product_id:
+                            productId,
+
+                        product_code:
+                            productCode,
+
+                        reason:
+                            'Not an Product Page. A 404 Page'
                     });
 
-                    let page = null;
+                } else {
 
-                    try {
+                    // -------------------------------------------------
+                    // AVAILABILITY
+                    // -------------------------------------------------
 
-                        /*
-                        |--------------------------------------------------------------------------
-                        | CREATE NEW PAGE FOR ONLY THIS PRODUCT
-                        |--------------------------------------------------------------------------
-                        */
+                    const status =
+                        (
+                            result.availability ||
+                            0
+                        )
 
-                        page = await browser.newPage();
+                    // -------------------------------------------------
+                    // IMAGE
+                    // -------------------------------------------------
 
-                        await page.setUserAgent(
-                            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36'
-                        );
+                    varProductImage =
+                        result.image ||
+                        'No Result';
 
-                        // Desktop viewport only
-                        await page.setViewport({
-                            width: 1366,
-                            height: 768,
-                            deviceScaleFactor: 1,
-                            isMobile: false,
-                            hasTouch: false
-                        });
+                    // -------------------------------------------------
+                    // REVIEW
+                    // -------------------------------------------------
 
-                        sendSSE('step', {
-                            status: true,
-                            step: 'page_created',
-                            productNumber: currentProductNumber,
-                            productId: product[`${companyId}_product_id`],
-                            message: 'New page created for product'
-                        });
+                    varProductReview =
+                        parseFloat(
+                            result.review
+                        ) || 0;
 
-                        /*
-                        |--------------------------------------------------------------------------
-                        | SCRAPE ONLY THIS PRODUCT
-                        |--------------------------------------------------------------------------
-                        */
+                    // -------------------------------------------------
+                    // RATING
+                    // -------------------------------------------------
 
-                        await page.goto(productUrl, {
-                            waitUntil: 'networkidle2',
-                            timeout: 50000
-                        });
+                    varProductRating =
+                        parseFloat(
+                            result.rating
+                        ) || 0;
 
-                        let varProductPrice = 'No Result';
-                        let varProductStock = 'No Result';
-                        let varProductImage = 'No Result';
-                        let varProductReview = 'No Result';
-                        let varProductRating = 'No Result';
-                        let scrapeStatus = 'pending';
+                    // -------------------------------------------------
+                    // PRICE
+                    // -------------------------------------------------
 
-                        const productContainer =
-                            await page.$('.main-detail_product_container__bFKim');
+                    const cleanedPrice =
+                        result.price || '';
 
-                        if (!productContainer) {
+                    const numericPrice =
+                        parseFloat(
+                            String(cleanedPrice)
+                                .replace(/[^0-9.]/g, '')
+                        ) || 0;
 
-                            console.log(
-                                `Product container not found: ${product[`${companyId}_product_id`]}`
-                            );
+                    // -------------------------------------------------
+                    // STOCK
+                    // -------------------------------------------------
 
-                        } else {
+                    if (
+                        (
+                            status > 0
+                        ) &&
+                        numericPrice > 0
+                    ) {
 
-                            const result = await page.evaluate(() => {
+                        varProductPrice =
+                            numericPrice;
 
-                                const nextDataElement =
-                                    document.querySelector('#__NEXT_DATA__');
+                        varProductStock =
+                            'In stock';
 
-                                if (!nextDataElement) {
-                                    return null;
-                                }
+                    } else if (
+                        status === 0 
+                    ) {
 
-                                try {
+                        varProductStock =
+                            'Out Of Stock';
 
-                                    const productData =
-                                        JSON.parse(nextDataElement.textContent);
+                        // Keep price as No Result
+                        // for unavailable products.
 
-                                    const pimData =
-                                        productData?.props?.pageProps?.pimData;
+                    }
 
-                                    if (!pimData) {
-                                        return null;
-                                    }
+                    scrapeStatus =
+                        'completed';
+                }
 
-                                    const image =
-                                        pimData?.image?.url || '';
+                // -------------------------------------------------
+                // MODIFIED DATE
+                // -------------------------------------------------
 
-                                    const salePrice =
-                                        pimData?.prices?.[0]?.sp?.[0]?.price || '';
+                const modifiedDate =
+                    getCurrentIndTimeInfo(
+                        'India_Railway_Date_Time'
+                    );
 
-                                    const review =
-                                        pimData?.review_count ?? 0;
+                // -------------------------------------------------
+                // PRICE CHANGE
+                // -------------------------------------------------
 
-                                    const rating =
-                                        pimData?.rating ?? 0;
+                await updatePriceChangeData(
 
-                                    const availabilityElement =
-                                        document.querySelector(
-                                            '.style_text_stock__eeCR_'
-                                        );
+                    scrapeStatus,
 
-                                    const availabilityText =
-                                        availabilityElement
-                                            ? availabilityElement.textContent.trim()
-                                            : '';
+                    product.product_price,
 
-                                    let availabilityStatus = 'outofstock';
+                    varProductPrice,
 
-                                    if (
-                                        availabilityText
-                                            .toLowerCase()
-                                            .includes('in stock')
-                                    ) {
-                                        availabilityStatus = 'instock';
-                                    }
+                    productId,
 
-                                    return {
-                                        price: salePrice,
-                                        availability: availabilityStatus,
-                                        image,
-                                        review,
-                                        rating
-                                    };
+                    productCode,
 
-                                } catch (error) {
+                    cronName,
 
-                                    return null;
+                    cmpid,
 
-                                }
+                    companyId
+                );
 
-                            });
+                // -------------------------------------------------
+                // UPDATE MONGO
+                // -------------------------------------------------
 
-                            if (result) {
+                await executeMongoUpdate(
 
-                                const status =
-                                    (result.availability || '')
-                                        .toLowerCase()
-                                        .trim();
+                    {
+                        collection:
+                            'ept_product_details_new_poorvika',
+                        cmpid
+                    },
 
-                                varProductImage =
-                                    result.image || 'No Result';
+                    {
+                        [`${companyId}_product_id`]:
+                            productId,
 
-                                varProductReview =
-                                    result.review != null
-                                        ? parseFloat(result.review) || 0
-                                        : 0;
+                        [`${companyId}_product_code`]:
+                            productCode
+                    },
 
-                                varProductRating =
-                                    result.rating != null
-                                        ? parseFloat(result.rating) || 0
-                                        : 0;
-
-                                if (status.includes('instock')) {
-
-                                    const cleanedPrice =
-                                        String(result.price || '')
-                                            .replace(/[^0-9.]/g, '');
-
-                                    varProductPrice =
-                                        parseFloat(cleanedPrice) || 0;
-
-                                    varProductStock = 'In stock';
-
-                                } else {
-
-                                    varProductStock = 'Out Of Stock';
-                                }
-
-                                scrapeStatus = 'completed';
-                            }
-                        }
-
-                        const modifiedDate =
-                            getCurrentIndTimeInfo('India_Railway_Date_Time');
-
-                        /*
-                        |--------------------------------------------------------------------------
-                        | PRICE CHANGE
-                        |--------------------------------------------------------------------------
-                        */
-
-                        await updatePriceChangeData(
-                            scrapeStatus,
-                            product.product_price,
-                            varProductPrice,
-                            product[`${companyId}_product_id`],
-                            product[`${companyId}_product_code`],
-                            cronName,
-                            cmpid,
-                            companyId
-                        );
-
-                        /*
-                        |--------------------------------------------------------------------------
-                        | MONGO UPDATE
-                        |--------------------------------------------------------------------------
-                        */
-
-                        await executeMongoUpdate(
-                            {
-                                collection: 'ept_product_details_new_poorvika',
-                                cmpid
-                            },
-                            {
-                                [`${companyId}_product_id`]:
-                                    product[`${companyId}_product_id`],
-
-                                [`${companyId}_product_code`]:
-                                    product[`${companyId}_product_code`]
-                            },
-                            {
-                                $set: {
-                                    product_price: varProductPrice,
-                                    product_stock: varProductStock,
-                                    product_image: varProductImage,
-                                    product_review: varProductReview,
-                                    product_rating: varProductRating,
-                                    modified_date: modifiedDate,
-                                    product_scrape_status: scrapeStatus
-                                }
-                            }
-                        );
-
-                        scrapedData.push({
-                            product_ean_id:
-                                product[`${companyId}_product_id`],
-
-                            product_code:
-                                product[`${companyId}_product_code`],
+                    {
+                        $set: {
 
                             product_price:
                                 varProductPrice,
@@ -485,259 +736,247 @@ async function poorvikaScraper(req, res) {
                             product_stock:
                                 varProductStock,
 
+                            product_image:
+                                varProductImage,
+
                             modified_date:
-                                modifiedDate
-                        });
+                                modifiedDate,
 
-                        productCount++;
+                            product_scrape_status:
+                                scrapeStatus,
 
-                        /*
-                        |--------------------------------------------------------------------------
-                        | CRON UPDATE
-                        |--------------------------------------------------------------------------
-                        */
+                            product_review:
+                                varProductReview,
 
-                        if (!isSingleProduct) {
-
-                            await updateEndTimeInDb(
-                                productCount,
-                                'running',
-                                cmpid,
-                                companyId,
-                                null,
-                                cronName,
-                                cronStartTime,
-                                ScrapingProductCount
-                            );
-                        }
-
-                        const progress =
-                            Number(
-                                ((productCount / ScrapingProductCount) * 100)
-                                    .toFixed(2)
-                            );
-
-                        /*
-                        |--------------------------------------------------------------------------
-                        | PRODUCT COMPLETE
-                        |--------------------------------------------------------------------------
-                        */
-
-                        sendSSE('product_complete', {
-                            status: true,
-                            productNumber: productCount,
-                            totalProducts: ScrapingProductCount,
-                            progress,
-                            productId:
-                                product[`${companyId}_product_id`],
-                            productCode:
-                                product[`${companyId}_product_code`],
-                            productPrice: varProductPrice,
-                            productStock: varProductStock,
-                            scrapeStatus
-                        });
-
-                        sendSSE('progress', {
-                            status: true,
-                            totalProducts: ScrapingProductCount,
-                            processedProducts: productCount,
-                            remainingProducts:
-                                ScrapingProductCount - productCount,
-                            progress,
-                            productId:
-                                product[`${companyId}_product_id`],
-                            productCode:
-                                product[`${companyId}_product_code`]
-                        });
-
-                    }
-                    catch (error) {
-
-                        console.error(
-                            `Error scraping product ${product[`${companyId}_product_id`]}:`,
-                            error.message
-                        );
-
-                        sendSSE('error', {
-                            status: false,
-                            productNumber: currentProductNumber,
-                            totalProducts: ScrapingProductCount,
-                            productId:
-                                product[`${companyId}_product_id`],
-                            productCode:
-                                product[`${companyId}_product_code`],
-                            productUrl,
-                            message: error.message
-                        });
-
-                    }
-                    finally {
-
-                        /*
-                        |--------------------------------------------------------------------------
-                        | CLOSE THIS PRODUCT PAGE
-                        |--------------------------------------------------------------------------
-                        */
-
-                        if (page) {
-
-                            try {
-
-                                await page.close();
-
-                                console.log(
-                                    `Page closed: ${product[`${companyId}_product_id`]}`
-                                );
-
-                                sendSSE('step', {
-                                    status: true,
-                                    step: 'page_closed',
-                                    productNumber: currentProductNumber,
-                                    productId:
-                                        product[`${companyId}_product_id`],
-                                    message: 'Product page closed successfully'
-                                });
-
-                            }
-                            catch (closeError) {
-
-                                console.error(
-                                    'Error closing product page:',
-                                    closeError.message
-                                );
-                            }
-
-                            // Remove reference
-                            page = null;
-                        }
-
-                        /*
-                        |--------------------------------------------------------------------------
-                        | SMALL CLEANUP DELAY
-                        |--------------------------------------------------------------------------
-                        */
-
-                        await delay(100);
-
-                        /*
-                        |--------------------------------------------------------------------------
-                        | OPTIONAL GC
-                        |--------------------------------------------------------------------------
-                        */
-
-                        if (
-                            global.gc &&
-                            productCount % 20 === 0
-                        ) {
-                            global.gc();
-
-                            console.log(
-                                `Garbage collection triggered after ${productCount} products`
-                            );
+                            product_rating:
+                                varProductRating
                         }
                     }
-                }
+                ); 
 
-                /*
-                |--------------------------------------------------------------------------
-                | END TIME
-                |--------------------------------------------------------------------------
-                */
+                // -------------------------------------------------
+                // RESULT
+                // -------------------------------------------------
 
-                const endTime = new Date(
-                    `${getCurrentIndTimeInfo('India_Railway_Date_Only')}T${getCurrentIndTimeInfo('India_Railway_Time')}`
+                const scrapedItem = {
+
+                    product_ean_id:
+                        productId,
+
+                    product_code:
+                        productCode,
+
+                    product_price:
+                        varProductPrice,
+
+                    product_stock:
+                        varProductStock,
+                    
+                    product_review:
+                        varProductReview,
+                    
+                    product_rating:
+                        varProductRating,
+
+                    modified_date:
+                        modifiedDate
+                };
+
+                scrapedData.push(
+                    scrapedItem
                 );
 
-                const diffMs = endTime - startTime;
+                productCount++;
 
-                const totalMins =
-                    +(diffMs / 60000).toFixed(2);
+                // -------------------------------------------------
+                // PRODUCT SCRAPED EVENT
+                // -------------------------------------------------
+
+                sendSSE(
+                    'product_scraped',
+                    {
+
+                        ...scrapedItem,
+
+                        scrape_status:
+                            scrapeStatus,
+
+                        progress: {
+
+                            current:
+                                productCount,
+
+                            total:
+                                ScrapingProductCount,
+
+                            percentage:
+                                Math.round(
+                                    (
+                                        productCount /
+                                        ScrapingProductCount
+                                    ) * 100
+                                )
+                        }
+                    }
+                );
+
+                // -------------------------------------------------
+                // CRON UPDATE
+                // -------------------------------------------------
 
                 if (!isSingleProduct) {
 
                     await updateEndTimeInDb(
+
                         productCount,
-                        'ending',
+
+                        'running',
+
                         cmpid,
+
                         companyId,
-                        totalMins,
+
+                        null,
+
                         cronName,
-                        cronStartTime,
+
+                        cronStarttime,
+
                         ScrapingProductCount
                     );
-
                 }
 
-                /*
-                |--------------------------------------------------------------------------
-                | FINAL SSE
-                |--------------------------------------------------------------------------
-                */
+            } catch (error) {
 
-                sendSSE('complete', {
-                    status: true,
-                    message: "Scraping completed",
-                    totalProcessed: productCount,
-                    totalProducts: ScrapingProductCount,
-                    progress: 100,
-                    data: scrapedData
-                });
+                console.error(
+                    `Error scraping poorvika product ${productId}:`,
+                    error.message
+                );
 
-                return res.end();
+                // ---------------------------------------------
+                // PRODUCT ERROR
+                // ---------------------------------------------
 
+                sendSSE(
+                    'product_error',
+                    {
+
+                        product_id:
+                            productId,
+
+                        product_code:
+                            productCode,
+
+                        error:
+                            error.message
+                    }
+                );
+
+                // ---------------------------------------------
+                // Do NOT stop entire scraper.
+                // Continue next product.
+                // ---------------------------------------------
+
+                continue;
             }
-            else {
-
-                sendSSE('complete', {
-                    status: true,
-                    message: "Active products not found",
-                    totalProcessed: 0,
-                    data: []
-                });
-
-                return res.end();
-
-            }
-
-        }
-        else {
-
-            sendSSE('complete', {
-                status: true,
-                message: "Competitor Products not found",
-                totalProcessed: 0,
-                data: []
-            });
-
-            return res.end();
-
         }
 
-    }
-    catch (error) {
+        // ---------------------------------------------------------
+        // END TIME
+        // ---------------------------------------------------------
 
-        console.error('Poorvika scraper error:', error);
+        const endTime =
+            new Date(
+                `${getCurrentIndTimeInfo(
+                    'India_Railway_Date_Only'
+                )}T${getCurrentIndTimeInfo(
+                    'India_Railway_Time'
+                )}`
+            );
 
-        sendSSE('error', {
-            status: false,
-            message: error.message
+        const diffMs =
+            endTime - startTime;
+
+        const totalMins =
+            +(
+                diffMs / 60000
+            ).toFixed(2);
+
+        // ---------------------------------------------------------
+        // CRON END
+        // ---------------------------------------------------------
+
+        if (!isSingleProduct) {
+
+            await updateEndTimeInDb(
+
+                productCount,
+
+                'ending',
+
+                cmpid,
+
+                companyId,
+
+                totalMins,
+
+                cronName,
+
+                cronStarttime,
+
+                ScrapingProductCount
+            );
+        }
+
+        // ---------------------------------------------------------
+        // COMPLETE
+        // ---------------------------------------------------------
+
+        sendSSE('complete', {
+
+            status: true,
+
+            message:
+                'poorvika scraping completed',
+
+            totalProcessed:
+                productCount,
+
+            totalProducts:
+                ScrapingProductCount,
+
+            totalMins,
+
+            data:
+                scrapedData
         });
 
         return res.end();
 
+    } catch (error) {
+
+        console.error(
+            'poorvika scraper fatal error:',
+            error
+        );
+
+        sendSSE('error', {
+
+            status: false,
+
+            message:
+                error.message,
+
+            stack:
+                process.env.NODE_ENV === 'development'
+                    ? error.stack
+                    : undefined
+        });
+
+        return res.end();
     }
-    finally {
-
-        if (browser) {
-
-            console.log('Closing browser...');
-
-            await browser.close();
-
-        }
-
-    }
-
 }
 
-module.exports = { poorvikaScraper };
+module.exports = {
+    poorvikaScraper
+};
