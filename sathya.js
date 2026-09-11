@@ -1,6 +1,4 @@
-const puppeteer = require('puppeteer');
-
-const { executeMongoFind, executeMongoCount, executeMongoUpdate } = require('./mongo');
+const { executeMongoFind, executeMongoUpdate } = require('./mongo');
 const { getCurrentIndTimeInfo, updateStartTimeInDb, updateEndTimeInDb } = require('./utils/cronTime');
 const { updatePriceChangeData } = require('./utils/priceChange');
 const cronName = 'sathya';
@@ -20,33 +18,6 @@ const delay = (ms) => new Promise(resolve => setTimeout(resolve, ms));
     let browser;
 
     try {
-
-        browser = await puppeteer.launch({
-            headless: true,
-            args: [
-                '--no-sandbox',
-                '--disable-setuid-sandbox',
-              //  '--proxy-server=http://31.59.20.176:6754'
-            ]
-        });
-
-        const page = await browser.newPage();
-        /*
-        await page.authenticate({
-            username: 'eqenhyym',
-            password: 'qsfp3x1obv71'
-        });
-        */
-        await page.setUserAgent(
-            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36'
-        );
-        /*
-        await page.goto(productUrl, {
-            waitUntil: 'networkidle2',
-            timeout: 30000
-        });
-        */
-        
         const cmpid = req.query.cmpid;
 
         if (!cmpid) {
@@ -147,16 +118,11 @@ const delay = (ms) => new Promise(resolve => setTimeout(resolve, ms));
                     let varProductImage;
                     let scrapeStatus;
                     let modifiedDate;
-                    let varProductReview;
-                    let varProductRating;
+                    let varProductReview = 0;
+                    let varProductRating = 0;
 
                     if(sathyaProduct){
                         try {
-                            await page.goto(productUrl, {
-                                waitUntil: 'networkidle2',
-                                timeout: 50000
-                            });
-
                             varProductImage = sathyaProduct.product_image;
                             const lspcleanedPrice = (sathyaProduct.lsp_price).replace(/[^0-9.]/g, '');
                             let cleanedPrice;
@@ -176,23 +142,6 @@ const delay = (ms) => new Promise(resolve => setTimeout(resolve, ms));
                                 varProductStock = 'Out Of Stock';
                             }
                             scrapeStatus = 'completed';
-                            
-                            const result = await page.evaluate(() => {
-                                const text = document.querySelector("div.rating-section h6")?.textContent?.trim();
-
-                                const match = text?.match(/^([\d.]+)\s*\((\d+)\s*Reviews?\)$/);
-
-                                const ratingValue = match?.[1] || "0";
-                                const reviewCount = match?.[2] || "0";
-
-                                return {
-                                    review: reviewCount || 0,
-                                    rating: ratingValue || 0
-                                };
-                            });
-
-                            varProductReview = result.review;
-                            varProductRating = result.rating;
                         }
                         catch (error) {
                             console.error(`Error scraping product ${product[`${companyId}_product_id`]}`);
