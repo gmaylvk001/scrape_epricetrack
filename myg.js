@@ -180,7 +180,7 @@ async function mygScraper(req, res) {
         // 1. PRODUCT NAME
         // =====================================================
 
-        if($('.mosuk-product-page')){
+        if($('.mosuk-product-page').length > 0){
             const jsonLdScripts = $('script[type="application/ld+json"]');
 
             if(jsonLdScripts.length > 0) {
@@ -896,25 +896,53 @@ async function mygScraper(req, res) {
                     error.message
                 );
 
-                // ---------------------------------------------
-                // PRODUCT ERROR
-                // ---------------------------------------------
+                if(error.message.includes('HTTP 404')){
+                    await executeMongoUpdate(
+                        {collection: 'ept_product_details_new_myg', cmpid},
+                        {[`${companyId}_product_id`]: productId,
+                            [`${companyId}_product_code`]: productCode
+                        },
+                        {$set: {
+                            product_price: 'No Result',
+                            product_stock: 'No Result',
+                            product_image: 'No Result',
+                            product_scrape_status: 'pending',
+                            product_review: 'No Result',
+                            product_rating: 'No Result'
+                        }
+                        }
+                    ); 
 
-                sendSSE(
-                    'product_error',
-                    {
+                    sendSSE(
+                        'product_error',
+                        {
+                            product_id: productId,
+                            product_code: productCode,
+                            product_scrape_status : 'Pending',
+                            error: `${error.message} product_scrape_status : Pending`
+                        }
+                    );
+                }
+                else{
+                    // ---------------------------------------------
+                    // PRODUCT ERROR
+                    // ---------------------------------------------
 
-                        product_id:
-                            productId,
+                    sendSSE(
+                        'product_error',
+                        {
 
-                        product_code:
-                            productCode,
+                            product_id:
+                                productId,
 
-                        error:
-                            error.message
-                    }
-                );
+                            product_code:
+                                productCode,
 
+                            error:
+                                error.message
+                        }
+                    );
+                }
                 // ---------------------------------------------
                 // Do NOT stop entire scraper.
                 // Continue next product.
