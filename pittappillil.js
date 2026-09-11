@@ -1,322 +1,1186 @@
-const puppeteer = require('puppeteer');
-const { getCurrentIndTimeInfo, updateStartTimeInDb, updateEndTimeInDb } = require('./utils/cronTime');
-const { executeMongoFind, executeMongoCount, executeMongoUpdate } = require('./mongo');
-const { updatePriceChangeData } = require('./utils/priceChange');
+const axios = require('axios');
+const cheerio = require('cheerio');
+
+const {
+    executeMongoFind,
+    executeMongoCount,
+    executeMongoUpdate
+} = require('./mongo');
+
+const {
+    getCurrentIndTimeInfo,
+    updateStartTimeInDb,
+    updateEndTimeInDb
+} = require('./utils/cronTime');
+
+const {
+    updatePriceChangeData
+} = require('./utils/priceChange');
+
 const cronName = 'pittappillil';
 
 async function pittappillilScraper(req, res) {
-const delay = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+
+    // ---------------------------------------------------------
+    // SSE SETUP
+    // ---------------------------------------------------------
+
+    res.setHeader('Content-Type', 'text/event-stream');
+    res.setHeader('Cache-Control', 'no-cache');
+    res.setHeader('Connection', 'keep-alive');
+    res.setHeader('X-Accel-Buffering', 'no');
+
+    // Flush headers immediately
+    if (typeof res.flushHeaders === 'function') {
+        res.flushHeaders();
+    }
+
+    const sendSSE = (type, data) => {
+        try {
+            if (res.writableEnded || res.destroyed) {
+                return;
+            }
+
+            res.write(`event: ${type}\n`);
+            res.write(`data: ${JSON.stringify(data)}\n\n`);
+
+            if (typeof res.flush === 'function') {
+                res.flush();
+            }
+        } catch (error) {
+            console.error('SSE send error:', error.message);
+        }
+    };
+
+    // ---------------------------------------------------------
+    // CURL / HTTP CONFIG
+    // ---------------------------------------------------------
+
+    const USER_AGENT =
+        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 ' +
+        '(KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36';
+
     
-    let browser;
+    const fetchProductPage = async (url, attempt = 1) => {
+
+        const maxAttempts = 3;
+
+        try {
+
+            const response = await axios.get(url, {
+                timeout: 30000,
+
+                maxRedirects: 5,
+
+                // Do not throw for normal HTTP responses.
+                validateStatus: (status) => {
+                    return status >= 200 && status < 500;
+                },
+
+                headers: {
+                    'User-Agent': USER_AGENT,
+
+                    'Accept':
+                        'text/html,application/xhtml+xml,application/xml;q=0.9,' +
+                        'image/avif,image/webp,*/*;q=0.8',
+
+                    'Accept-Language':
+                        'en-IN,en;q=0.9,en-US;q=0.8',
+
+                    'Accept-Encoding':
+                        'gzip, deflate, br',
+
+                    'Cache-Control':
+                        'no-cache',
+
+                    'Pragma':
+                        'no-cache',
+
+                    'Upgrade-Insecure-Requests':
+                        '1',
+
+                    'Sec-Fetch-Dest':
+                        'document',
+
+                    'Sec-Fetch-Mode':
+                        'navigate',
+
+                    'Sec-Fetch-Site':
+                        'none',
+
+                    'Sec-Fetch-User':
+                        '?1',
+
+                    'Connection':
+                        'keep-alive'
+                },
+
+                // Prevent axios from converting response unexpectedly.
+                responseType: 'text',
+
+                decompress: true
+            });
+
+            if (response.status < 200 || response.status >= 400) {
+                throw new Error(
+                    `Pittappillil returned HTTP ${response.status}`
+                );
+            }
+
+            if (!response.data) {
+                throw new Error('Empty response from  Pittappillil');
+            }
+
+            return response.data;
+
+        } catch (error) {
+
+            console.error(
+                `Pittappillil request failed (attempt ${attempt}/${maxAttempts}):`,
+                error.message
+            );
+
+            if (attempt < maxAttempts) {
+
+                // Small retry delay
+                await new Promise(resolve =>
+                    setTimeout(resolve, 1500 * attempt)
+                );
+
+                return fetchProductPage(
+                    url,
+                    attempt + 1
+                );
+            }
+
+            throw error;
+        }
+    };
+
+    // ---------------------------------------------------------
+    // PARSE Pittappillil PRODUCT HTML
+    // ---------------------------------------------------------
+    
+
+    const parsePittappillilProduct = (html) => {
+
+        const $ = cheerio.load(html);
+
+        let name = '';
+        let price = '';
+        let availability = '';
+        let image = '';
+        let review = 0;
+        let rating = 0;
+
+        try {
+
+            // ============================================
+            // 1. CHECK PRODUCT PAGE
+            // ============================================
+
+            if ($('div.product-details-block h2').length === 0) {
+                return {
+                    name,
+                    price,
+                    availability: 'Out of stock',
+                    image,
+                    review,
+                    rating
+                };
+            }
+
+
+            // ============================================
+            // 2. PRODUCT NAME
+            // ============================================
+
+            name =
+                $('div.product-details-block h2')
+                    .first()
+                    .text()
+                    .trim() ||
+                $('h2')
+                    .first()
+                    .text()
+                    .trim();
+
+
+            // ============================================
+            // 3. PRODUCT PRICE
+            // PHP:
+            // div.product-details-block
+            // div.price-list h3
+            // ============================================
+
+            const priceText = $(
+                'div.product-details-block div.price-list h3'
+            )
+                .first()
+                .text()
+                .trim();
+
+            const parsedPrice = parseFloat(
+                priceText.replace(/[^0-9.]/g, '')
+            );
+
+            if (parsedPrice > 0) {
+                price = parsedPrice;
+            }
+
+
+            // ============================================
+            // 4. BUY NOW BUTTON / STOCK
+            // PHP:
+            // a[class*=buy-now-btn]
+            // ============================================
+
+            const buyNowButton = $(
+                'a[class*="buy-now-btn"]'
+            ).first();
+
+            if (price && price > 0 && buyNowButton.length > 0) {
+
+                availability = 'In stock';
+
+            } else {
+
+                price = '';
+                availability = 'Out of stock';
+
+            }
+
+
+            // ============================================
+            // 5. PRODUCT IMAGE
+            // PHP:
+            // div.product-details-img-block img
+            // src OR data-src
+            // ============================================
+
+            const imageElement = $(
+                'div.product-details-img-block img'
+            ).first();
+
+            if (imageElement.length > 0) {
+
+                image =
+                    imageElement.attr('src') ||
+                    imageElement.attr('data-src') ||
+                    '';
+
+            }
+
+
+            // ============================================
+            // 6. IMAGE URL
+            // ============================================
+
+            if (image && image.startsWith('//')) {
+                image = `https:${image}`;
+            }
+
+
+        } catch (error) {
+
+            console.log(
+                'Pittappillil parser error:',
+                error.message
+            );
+
+        }
+
+
+        return {
+            name,
+            price,
+            availability,
+            image,
+            review,
+            rating
+        };
+    };
+
+    // ---------------------------------------------------------
+    // MAIN
+    // ---------------------------------------------------------
 
     try {
 
-        browser = await puppeteer.launch({
-            headless: true,
-            args: [
-                '--no-sandbox',
-                '--disable-setuid-sandbox',
-                /* '--proxy-server=http://31.59.20.176:6754' */
-            ]
-        });
-
-        const page = await browser.newPage();
-
-        /*
-            await page.authenticate({
-                username: 'eqenhyym',
-                password: 'qsfp3x1obv71'
-            });
-        */
-
-        await page.setUserAgent(
-            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36'
-        );
-
-        /*
-            await page.goto(productUrl, {
-                waitUntil: 'networkidle2',
-                timeout: 30000
-            });
-        */
-        
         const cmpid = req.query.cmpid;
+
         if (!cmpid) {
-            return res.status(400).json({
-                status: false,
+
+            sendSSE('error', {
                 message: 'cmpid is required'
             });
+
+            return res.end();
         }
-        const companyId = cmpid.replace('plm_user_info_', '');
+
+        const companyId =
+            cmpid.replace('plm_user_info_', '');
+
         const ean = req.query.ean;
         const itemcode = req.query.itemcode;
 
+        const isSingleProduct =
+            !!(ean && itemcode);
+
+        // -----------------------------------------------------
+        // START
+        // -----------------------------------------------------
+
+        sendSSE('start', {
+            status: true,
+            message: 'Pittappillil scraping started',
+            cmpid,
+            companyId,
+            isSingleProduct
+        });
+
+        // -----------------------------------------------------
+        // FILTER
+        // -----------------------------------------------------
+
         const filter = {
+
             status: 'active',
-            product_scrape_status: { $in: ['pending', 'completed'] },
-            product_url: { $nin: ['', null, 'No Result'] }
+
+            product_scrape_status: {
+                $in: [
+                    'pending',
+                    'completed'
+                ]
+            },
+
+            product_url: {
+                $nin: [
+                    '',
+                    null,
+                    'No Result'
+                ]
+            }
         };
 
-        const isSingleProduct = !!(ean && itemcode);
+        // -----------------------------------------------------
+        // SINGLE PRODUCT
+        // -----------------------------------------------------
 
-        if(isSingleProduct){
-            filter[`${companyId}_product_id`] = ean;
-            filter[`${companyId}_product_code`] = itemcode;
+        if (isSingleProduct) {
+
+            filter[
+                `${companyId}_product_id`
+            ] = ean;
+
+            filter[
+                `${companyId}_product_code`
+            ] = itemcode;
         }
+
+        // -----------------------------------------------------
+        // FETCH PRODUCTS
+        // -----------------------------------------------------
+
+        sendSSE('step', {
+            step: 'products',
+            status: 'running',
+            message: 'Fetching products from database...'
+        });
 
         const products = await executeMongoFind(
             {
-                collection: 'ept_product_details_new_pittappillil',
+                collection:
+                    'ept_product_details_new_pittappillil',
                 cmpid
             },
             filter,
-            { _id: 0 }
+            {
+                _id: 0
+            }
         );
 
-        if(products.length > 0){
+        // -----------------------------------------------------
+        // NO PRODUCTS
+        // -----------------------------------------------------
 
-            const existingProducts = await executeMongoFind(
+        if (!products || products.length === 0) {
+
+            sendSSE('complete', {
+                status: true,
+                message: 'Products Not Found',
+                totalProcessed: 0,
+                data: []
+            });
+
+            return res.end();
+        }
+
+        sendSSE('products_found', {
+            message:
+                `Found ${products.length} products in source collection`,
+            count: products.length
+        });
+
+        // -----------------------------------------------------
+        // FETCH EXISTING PRODUCTS
+        // -----------------------------------------------------
+
+        sendSSE('step', {
+            step: 'matching',
+            status: 'running',
+            message: 'Matching products with main product collection...'
+        });
+
+        const existingProducts =
+            await executeMongoFind(
                 {
-                    collection: 'ept_product_details_new',
+                    collection:
+                        'ept_product_details_new',
                     cmpid
                 },
                 {
                     $and: [
-                        { status: 'active' },
-                        {ean_product_data_details_scrap_status : 'completed'}
+                        {
+                            status: 'active'
+                        },
+                        {
+                            ean_product_data_details_scrap_status:
+                                'completed'
+                        }
                     ]
                 },
-                { _id: 0, product_ean_id: 1, product_code: 1 }
+                {
+                    _id: 0,
+                    product_ean_id: 1,
+                    product_code: 1
+                }
             );
 
-            const productMap = new Set();
+        // -----------------------------------------------------
+        // CREATE PRODUCT MAP
+        // -----------------------------------------------------
+  
 
-            existingProducts.forEach((row) => {
-                const key = `${row.product_ean_id}_${row.product_code}`;
+        const productMap = new Set();
+
+        if (Array.isArray(existingProducts)) {
+
+            existingProducts.forEach(row => {
+
+                const key =
+                    `${row.product_ean_id}_${row.product_code}`;
+
                 productMap.add(key);
             });
+        }
 
-            const ArrGetProductInfo = [];
-            products.forEach((arrTmp) => {
-                const key = `${arrTmp[`${companyId}_product_id`]}_${arrTmp[`${companyId}_product_code`]}`;
+        // -----------------------------------------------------
+        // FILTER PRODUCTS
+        // -----------------------------------------------------
 
-                if (productMap.has(key) && arrTmp['product_url'].includes('https://www.pittappillilonline.com')) {
-                    ArrGetProductInfo.push(arrTmp);
-                }
-            });
+        const ArrGetProductInfo = [];
 
-            if(ArrGetProductInfo.length > 0){
+        products.forEach(product => {
 
-                let productCount = 0;
-                const startTime = new Date(`${getCurrentIndTimeInfo('India_Railway_Date_Only')}T${getCurrentIndTimeInfo('India_Railway_Time')}`);
-                const cronStartTime = getCurrentIndTimeInfo();
-                const ScrapingProductCount = ArrGetProductInfo.length;
-                if (!isSingleProduct) {
-                    await updateStartTimeInDb(cmpid, companyId, cronName, ScrapingProductCount);
-                }
+            const productId =
+                product[
+                    `${companyId}_product_id`
+                ];
 
-                const scrapedData = [];
+            const productCode =
+                product[
+                    `${companyId}_product_code`
+                ];
 
-                for (const product of ArrGetProductInfo) {
+            const productUrl =
+                product.product_url;
 
-                    const productUrl = product.product_url;
-                    const hostname = new URL(productUrl).hostname; 
-
-                    let result = {};
-
-                    if (hostname.includes('pittappillilonline')) {
-                        try {
-                            await page.goto(productUrl, {
-                                waitUntil: 'networkidle2',
-                                timeout: 50000
-                            });
-
-                            let varProductPrice;
-                            let varProductStock;
-                            let varProductImage;
-                            let varProductReview;
-                            let varProductRating;
-                            let scrapeStatus;
-                            let modifiedDate;
-
-                            if(await page.$('#product-details-section') === null) {
-
-                                varProductPrice  = 'No Result';
-                                varProductStock  = 'No Result';
-                                varProductImage  = 'No Result';
-                                varProductReview = 'No Result';
-                                varProductRating = 'No Result';
-                                scrapeStatus     = 'pending';
-                            }
-
-                            else{
-
-                                const result = await page.evaluate(async (productUrl) => {
-
-                                    const getText = (selector) => {
-                                        const el = document.querySelector(selector);
-                                        return el ? el.textContent.trim() : '';
-                                    }
-
-                                    const getAttr = (selector, attr) => {
-                                        const el = document.querySelector(selector);
-                                        return el ? el.getAttribute(attr) : '';
-                                    };
-                                
-                                    return {
-                                        price: getText('div.product-details-block div.price-list h3') || '',
-                                        stock: getText('.buy-now-btn') || '',
-                                        image: getAttr('div.product-details-img-block img', 'src') || getAttr('div.product-details-img-block img', 'data-src') || '',
-                                        review: 0,
-                                        rating: 0
-                                    };
-
-                                }, productUrl);
-                                
-                                varProductPrice  = 'No Result';
-                                varProductStock  = 'No Result';
-                                varProductImage  = 'No Result';
-                                varProductReview = 'No Result';
-                                varProductRating = 'No Result';
-                                scrapeStatus     = 'pending';
- 
-                                if (result.stock) {
-
-                                    const status = (result.stock || '').toLowerCase().trim();
-                                    if (status.includes('buy now')) {
-                                        
-                                        const priceValue = result.price.match(/[\d,]+(?:\.\d+)?/)?.[0] || '';
-                                        const numericPrice = parseFloat(priceValue.replace(/,/g, ''));
-                                        if (numericPrice > 0) {
-
-                                           varProductPrice  = numericPrice; 
-                                           varProductStock  = 'In stock';
-                                           varProductImage  = result.image;
-                                           varProductReview = result.review;
-                                           varProductRating = result.rating;
-
-                                        } 
-                                    } else {
-
-                                        varProductStock  = 'Out Of Stock';
-                                        varProductImage  = result.image;
-                                        varProductReview = result.review;
-                                        varProductRating = result.rating;
-            
-                                    }
-                                    scrapeStatus = 'completed';
-                                }
-                            }
-
-                            modifiedDate = getCurrentIndTimeInfo('India_Railway_Date_Time');
-
-                            updatePriceChangeData(scrapeStatus,product.product_price,varProductPrice,product[`${companyId}_product_id`],product[`${companyId}_product_code`],cronName,cmpid,companyId,);
-
-                            await executeMongoUpdate(
-                                {
-                                    collection: 'ept_product_details_new_pittappillil',
-                                    cmpid
-                                },
-                                {
-                                    [`${companyId}_product_id`]:
-                                        product[`${companyId}_product_id`],
-
-                                    [`${companyId}_product_code`]:
-                                        product[`${companyId}_product_code`]
-                                },
-                                {
-                                    $set: {
-                                        product_price: varProductPrice,
-                                        product_stock: varProductStock,
-                                        product_image: varProductImage,
-                                        product_review: varProductReview,
-                                        product_rating: varProductRating,
-                                        modified_date: modifiedDate,
-                                        product_scrape_status: scrapeStatus
-                                    }
-                                }
-                            );
-
-                            scrapedData.push({
-                                product_ean_id: product[`${companyId}_product_id`],
-                                product_code: product[`${companyId}_product_code`],
-                                product_price: varProductPrice,
-                                product_stock: varProductStock,
-                                modified_date: modifiedDate
-                            });
-
-                            productCount++;
-                            if (!isSingleProduct) {
-                                await updateEndTimeInDb(productCount, 'running', cmpid, companyId, null, cronName, cronStartTime, ScrapingProductCount);
-                                console.log(`${companyId}_product_id`);
-                            }
-                            
-                        }
-                        catch (error) {
-                            console.error(`Error scraping product ${product[`${companyId}_product_id`]}`);
-                            console.error(error);
-                        }
-                    }
-
-                    else {
-                        console.log(`${companyId}_product_id`);
-                        console.log(productUrl);
-                        return res.status(400).json({
-                            status: false,
-                            message: 'Only pittappillilonline URLs supported'
-                        });
-
-                    }
-                };
-
-                const endTime = new Date(`${getCurrentIndTimeInfo('India_Railway_Date_Only')}T${getCurrentIndTimeInfo('India_Railway_Time')}`);
-
-                const diffMs = endTime - startTime;
-                const totalMins = +(diffMs / 60000).toFixed(2);
-
-                if (!isSingleProduct) {
-                    await updateEndTimeInDb(productCount, 'ending', cmpid, companyId, totalMins, cronName, cronStartTime, ScrapingProductCount);
-                }
-
-                return res.status(200).json({
-                    status: true,
-                    message: "Scraping completed",
-                    totalProcessed: productCount,
-                    data : scrapedData
-                });
-
-            }else{
-
-                return res.status(200).json({
-                    status: true,
-                    message: "Active products not found"
-                });
+            if (!productUrl) {
+                return;
             }
 
-        }else{
+            const key =
+                `${productId}_${productCode}`;
 
-            return res.status(200).json({
+            // Only matching main products
+            if (!productMap.has(key)) {
+                return;
+            }
+
+            // Only Relinace Digital URLs
+            if (
+                !productUrl
+                    .toLowerCase()
+                    .startsWith('https://www.pittappillilonline.com/')
+            ) {
+                return;
+            }
+
+            ArrGetProductInfo.push(product);
+        });
+
+
+        // -----------------------------------------------------
+        // NO MATCHING PRODUCTS
+        // -----------------------------------------------------
+
+        if (ArrGetProductInfo.length === 0) {
+
+            sendSSE('complete', {
                 status: true,
-                message: "Competitor Products not found"
+                message: 'Active Products Not Found',
+                totalProcessed: 0,
+                data: []
             });
+
+            return res.end();
         }
+
+        sendSSE('filtered_products', {
+            message:
+                `Found ${ArrGetProductInfo.length} products to scrape`,
+            count:
+                ArrGetProductInfo.length
+        });
+
+        // -----------------------------------------------------
+        // SCRAPING COUNT
+        // -----------------------------------------------------
+
+        const ScrapingProductCount =
+            ArrGetProductInfo.length;
+
+        const startTime =
+            new Date(
+                `${getCurrentIndTimeInfo(
+                    'India_Railway_Date_Only'
+                )}T${getCurrentIndTimeInfo(
+                    'India_Railway_Time'
+                )}`
+            );
+
+        const cronStarttime =
+            getCurrentIndTimeInfo();
+
+        // -----------------------------------------------------
+        // CRON START
+        // -----------------------------------------------------
+
+        if (!isSingleProduct) {
+
+            await updateStartTimeInDb(
+                cmpid,
+                companyId,
+                cronName,
+                ScrapingProductCount
+            );
+        }
+
+        let productCount = 0;
+
+        const scrapedData = [];
+
+        // -----------------------------------------------------
+        // PRODUCT LOOP
+        // -----------------------------------------------------
+
+        for (
+            const product
+            of ArrGetProductInfo
+        ) {
+
+            const productId =
+                product[
+                    `${companyId}_product_id`
+                ];
+
+            const productCode =
+                product[
+                    `${companyId}_product_code`
+                ];
+
+            const productUrl =
+                product.product_url;
+
+            // -------------------------------------------------
+            // PROGRESS
+            // -------------------------------------------------
+
+            sendSSE('progress', {
+
+                current:
+                    productCount + 1,
+
+                total:
+                    ScrapingProductCount,
+
+                product_id:
+                    productId,
+
+                product_code:
+                    productCode,
+
+                url:
+                    productUrl,
+
+                percentage:
+                    Math.round(
+                        (
+                            (productCount + 1) /
+                            ScrapingProductCount
+                        ) * 100
+                    )
+            });
+
+            // -------------------------------------------------
+            // URL VALIDATION
+            // -------------------------------------------------
+
+            let hostname;
+
+            try {
+
+                hostname =
+                    new URL(productUrl)
+                        .hostname
+                        .toLowerCase();
+
+            } catch (error) {
+
+                sendSSE('product_error', {
+
+                    product_id:
+                        productId,
+
+                    product_code:
+                        productCode,
+
+                    error:
+                        'Invalid product URL'
+                });
+
+                continue;
+            }
+
+            if (!hostname.includes('pittappillilonline.com')) {
+
+                sendSSE('warning', {
+
+                    message:
+                        'Only Pittappillil URLs supported',
+
+                    url:
+                        productUrl
+                });
+
+                continue;
+            }
+
+            // -------------------------------------------------
+            // DEFAULT VALUES
+            // -------------------------------------------------
+
+            let varProductPrice =
+                'No Result';
+
+            let varProductStock =
+                'No Result';
+
+            let varProductImage =
+                'No Result';
+
+            let varProductReview =
+                'No Result';
+
+            let varProductRating =
+                'No Result';
+
+            let scrapeStatus =
+                'pending';
+
+            // -------------------------------------------------
+            // SCRAPE
+            // -------------------------------------------------
+
+            try {
+
+                sendSSE('product_start', {
+
+                    product_id:
+                        productId,
+
+                    product_code:
+                        productCode,
+
+                    url:
+                        productUrl,
+
+                    status:
+                        'scraping'
+                });
+
+                // -------------------------------------------------
+                // HTTP REQUEST
+                // -------------------------------------------------
+
+                const html =
+                    await fetchProductPage(
+                        productUrl
+                    );
+            
+
+                // -------------------------------------------------
+                // PARSE HTML
+                // -------------------------------------------------
+
+                const result =
+                    parsePittappillilProduct(html);
+
+                // -------------------------------------------------
+                // PRODUCT NOT FOUND
+                // -------------------------------------------------
+
+                if (result === null) {
+
+                    varProductPrice =
+                        'No Result';
+
+                    varProductStock =
+                        'No Result';
+
+                    varProductImage =
+                        'No Result';
+
+                    varProductReview =
+                        'No Result';
+
+                    varProductRating =
+                        'No Result';
+
+                    scrapeStatus =
+                        'pending';
+
+                    sendSSE('product_failed', {
+
+                        product_id:
+                            productId,
+
+                        product_code:
+                            productCode,
+
+                        reason:
+                            'Product JSON/schema not found'
+                    });
+
+                } else {
+
+                    // -------------------------------------------------
+                    // AVAILABILITY
+                    // -------------------------------------------------
+
+                    const status =
+                        (
+                            result.availability ||
+                            ''
+                        )
+                            .toLowerCase()
+                            .trim();
+
+                    // -------------------------------------------------
+                    // IMAGE
+                    // -------------------------------------------------
+
+                    varProductImage =
+                        result.image ||
+                        'No Result';
+
+                    // -------------------------------------------------
+                    // REVIEW
+                    // -------------------------------------------------
+
+                    varProductReview =
+                        parseFloat(
+                            result.review
+                        ) || 0;
+
+                    // -------------------------------------------------
+                    // RATING
+                    // -------------------------------------------------
+
+                    varProductRating =
+                        parseFloat(
+                            result.rating
+                        ) || 0;
+
+                    // -------------------------------------------------
+                    // PRICE
+                    // -------------------------------------------------
+
+                    const cleanedPrice =
+                        result.price || '';
+
+                    const numericPrice =
+                        parseFloat(
+                            String(cleanedPrice)
+                                .replace(/[^0-9.]/g, '')
+                        ) || 0;
+
+                    // -------------------------------------------------
+                    // STOCK
+                    // -------------------------------------------------
+
+                    if (
+                        (
+                            status.includes('instock') ||
+                            status.includes('in stock')
+                        ) &&
+                        numericPrice > 0
+                    ) {
+
+                        varProductPrice =
+                            numericPrice;
+
+                        varProductStock =
+                            'In stock';
+
+                    } else if (
+                        status.includes('outofstock') ||
+                        status.includes('out of stock') ||
+                        status.includes('currently unavailable')
+                    ) {
+
+                        varProductStock =
+                            'Out Of Stock';
+
+                        // Keep price as No Result
+                        // for unavailable products.
+
+                    } else {
+
+                        // Unknown availability.
+                        // If price exists, keep it,
+                        // otherwise No Result.
+
+                        if (numericPrice > 0) {
+
+                            varProductPrice =
+                                numericPrice;
+                        }
+
+                        if (status) {
+
+                            varProductStock =
+                                status;
+                        }
+                    }
+
+                    scrapeStatus =
+                        'completed';
+                }
+
+                // -------------------------------------------------
+                // MODIFIED DATE
+                // -------------------------------------------------
+
+                const modifiedDate =
+                    getCurrentIndTimeInfo(
+                        'India_Railway_Date_Time'
+                    );
+
+                // -------------------------------------------------
+                // PRICE CHANGE
+                // -------------------------------------------------
+
+                await updatePriceChangeData(
+
+                    scrapeStatus,
+
+                    product.product_price,
+
+                    varProductPrice,
+
+                    productId,
+
+                    productCode,
+
+                    cronName,
+
+                    cmpid,
+
+                    companyId
+                );
+
+                // -------------------------------------------------
+                // UPDATE MONGO
+                // -------------------------------------------------
+
+                await executeMongoUpdate(
+
+                    {
+                        collection:
+                            'ept_product_details_new_pittappillil',
+                        cmpid
+                    },
+
+                    {
+                        [`${companyId}_product_id`]:
+                            productId,
+
+                        [`${companyId}_product_code`]:
+                            productCode
+                    },
+
+                    {
+                        $set: {
+
+                            product_price:
+                                varProductPrice,
+
+                            product_stock:
+                                varProductStock,
+
+                            product_image:
+                                varProductImage,
+
+                            modified_date:
+                                modifiedDate,
+
+                            product_scrape_status:
+                                scrapeStatus,
+
+                            product_review:
+                                varProductReview,
+
+                            product_rating:
+                                varProductRating
+                        }
+                    }
+                ); 
+
+                // -------------------------------------------------
+                // RESULT
+                // -------------------------------------------------
+
+                const scrapedItem = {
+
+                    product_ean_id:
+                        productId,
+
+                    product_code:
+                        productCode,
+
+                    product_price:
+                        varProductPrice,
+
+                    product_stock:
+                        varProductStock,
+                    
+                    product_review:
+                        varProductReview,
+                    
+                    product_rating:
+                        varProductRating,
+
+                    modified_date:
+                        modifiedDate
+                };
+
+                scrapedData.push(
+                    scrapedItem
+                );
+
+                productCount++;
+
+                // -------------------------------------------------
+                // PRODUCT SCRAPED EVENT
+                // -------------------------------------------------
+
+                sendSSE(
+                    'product_scraped',
+                    {
+
+                        ...scrapedItem,
+
+                        scrape_status:
+                            scrapeStatus,
+
+                        progress: {
+
+                            current:
+                                productCount,
+
+                            total:
+                                ScrapingProductCount,
+
+                            percentage:
+                                Math.round(
+                                    (
+                                        productCount /
+                                        ScrapingProductCount
+                                    ) * 100
+                                )
+                        }
+                    }
+                );
+
+                // -------------------------------------------------
+                // CRON UPDATE
+                // -------------------------------------------------
+
+                if (!isSingleProduct) {
+
+                    await updateEndTimeInDb(
+
+                        productCount,
+
+                        'running',
+
+                        cmpid,
+
+                        companyId,
+
+                        null,
+
+                        cronName,
+
+                        cronStarttime,
+
+                        ScrapingProductCount
+                    );
+                }
+
+            } catch (error) {
+
+                console.error(
+                    `Error scraping Pittappillil product ${productId}:`,
+                    error.message
+                );
+
+                // ---------------------------------------------
+                // PRODUCT ERROR
+                // ---------------------------------------------
+
+                sendSSE(
+                    'product_error',
+                    {
+
+                        product_id:
+                            productId,
+
+                        product_code:
+                            productCode,
+
+                        error:
+                            error.message
+                    }
+                );
+
+                // ---------------------------------------------
+                // Do NOT stop entire scraper.
+                // Continue next product.
+                // ---------------------------------------------
+
+                continue;
+            }
+        }
+
+        // ---------------------------------------------------------
+        // END TIME
+        // ---------------------------------------------------------
+
+        const endTime =
+            new Date(
+                `${getCurrentIndTimeInfo(
+                    'India_Railway_Date_Only'
+                )}T${getCurrentIndTimeInfo(
+                    'India_Railway_Time'
+                )}`
+            );
+
+        const diffMs =
+            endTime - startTime;
+
+        const totalMins =
+            +(
+                diffMs / 60000
+            ).toFixed(2);
+
+        // ---------------------------------------------------------
+        // CRON END
+        // ---------------------------------------------------------
+
+        if (!isSingleProduct) {
+
+            await updateEndTimeInDb(
+
+                productCount,
+
+                'ending',
+
+                cmpid,
+
+                companyId,
+
+                totalMins,
+
+                cronName,
+
+                cronStarttime,
+
+                ScrapingProductCount
+            );
+        }
+
+        // ---------------------------------------------------------
+        // COMPLETE
+        // ---------------------------------------------------------
+
+        sendSSE('complete', {
+
+            status: true,
+
+            message:
+                'Pittappillil scraping completed',
+
+            totalProcessed:
+                productCount,
+
+            totalProducts:
+                ScrapingProductCount,
+
+            totalMins,
+
+            data:
+                scrapedData
+        });
+
+        return res.end();
 
     } catch (error) {
 
-        res.status(500).json({
+        console.error(
+            'Pittappillil scraper fatal error:',
+            error
+        );
+
+        sendSSE('error', {
+
             status: false,
-            message: error.message
+
+            message:
+                error.message,
+
+            stack:
+                process.env.NODE_ENV === 'development'
+                    ? error.stack
+                    : undefined
         });
 
-    } finally {
-
-        if (browser) {
-            console.log('Closing browser...');
-            await browser.close();
-        }
-
+        return res.end();
     }
+}
 
+module.exports = {
+    pittappillilScraper
 };
-
-module.exports = { pittappillilScraper };

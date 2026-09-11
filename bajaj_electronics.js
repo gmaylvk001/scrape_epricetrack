@@ -1,315 +1,1147 @@
-const puppeteer = require('puppeteer');
+const axios = require('axios');
+const cheerio = require('cheerio');
 
-const { executeMongoFind, executeMongoCount, executeMongoUpdate } = require('./mongo');
-const { getCurrentIndTimeInfo, updateStartTimeInDb, updateEndTimeInDb } = require('./utils/cronTime');
-const { updatePriceChangeData } = require('./utils/priceChange');
+const {
+    executeMongoFind,
+    executeMongoCount,
+    executeMongoUpdate
+} = require('./mongo');
+
+const {
+    getCurrentIndTimeInfo,
+    updateStartTimeInDb,
+    updateEndTimeInDb
+} = require('./utils/cronTime');
+
+const {
+    updatePriceChangeData
+} = require('./utils/priceChange');
+
 const cronName = 'bajaj_electronics';
 
 async function bajaj_electronicsScraper(req, res) {
-const delay = (ms) => new Promise(resolve => setTimeout(resolve, ms));
-    /*
-    const productUrl = req.query.url;
 
-    if (!productUrl) {
-        return res.status(400).json({
-            status: false,
-            message: 'URL is required'
-        });
+    // ---------------------------------------------------------
+    // SSE SETUP
+    // ---------------------------------------------------------
+
+    res.setHeader('Content-Type', 'text/event-stream');
+    res.setHeader('Cache-Control', 'no-cache');
+    res.setHeader('Connection', 'keep-alive');
+    res.setHeader('X-Accel-Buffering', 'no');
+
+    // Flush headers immediately
+    if (typeof res.flushHeaders === 'function') {
+        res.flushHeaders();
     }
-    */
-    let browser;
+
+    const sendSSE = (type, data) => {
+        try {
+            if (res.writableEnded || res.destroyed) {
+                return;
+            }
+
+            res.write(`event: ${type}\n`);
+            res.write(`data: ${JSON.stringify(data)}\n\n`);
+
+            if (typeof res.flush === 'function') {
+                res.flush();
+            }
+        } catch (error) {
+            console.error('SSE send error:', error.message);
+        }
+    };
+
+    // ---------------------------------------------------------
+    // CURL / HTTP CONFIG
+    // ---------------------------------------------------------
+
+    const USER_AGENT =
+        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 ' +
+        '(KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36';
+
+    
+    const fetchProductPage = async (url, attempt = 1) => {
+
+        const maxAttempts = 3;
+
+        try {
+
+            const response = await axios.get(url, {
+                timeout: 30000,
+
+                maxRedirects: 5,
+
+                // Do not throw for normal HTTP responses.
+                validateStatus: (status) => {
+                    return status >= 200 && status < 500;
+                },
+
+                headers: {
+                    'User-Agent': USER_AGENT,
+
+                    'Accept':
+                        'text/html,application/xhtml+xml,application/xml;q=0.9,' +
+                        'image/avif,image/webp,*/*;q=0.8',
+
+                    'Accept-Language':
+                        'en-IN,en;q=0.9,en-US;q=0.8',
+
+                    'Accept-Encoding':
+                        'gzip, deflate, br',
+
+                    'Cache-Control':
+                        'no-cache',
+
+                    'Pragma':
+                        'no-cache',
+
+                    'Upgrade-Insecure-Requests':
+                        '1',
+
+                    'Sec-Fetch-Dest':
+                        'document',
+
+                    'Sec-Fetch-Mode':
+                        'navigate',
+
+                    'Sec-Fetch-Site':
+                        'none',
+
+                    'Sec-Fetch-User':
+                        '?1',
+
+                    'Connection':
+                        'keep-alive'
+                },
+
+                // Prevent axios from converting response unexpectedly.
+                responseType: 'text',
+
+                decompress: true
+            });
+
+            if (response.status < 200 || response.status >= 400) {
+                throw new Error(
+                    `bajaj Electronics returned HTTP ${response.status}`
+                );
+            }
+
+            if (!response.data) {
+                throw new Error('Empty response from bajaj Electronics');
+            }
+
+            return response.data;
+
+        } catch (error) {
+
+            console.error(
+                `bajaj Electronics request failed (attempt ${attempt}/${maxAttempts}):`,
+                error.message
+            );
+
+            if (attempt < maxAttempts) {
+
+                // Small retry delay
+                await new Promise(resolve =>
+                    setTimeout(resolve, 1500 * attempt)
+                );
+
+                return fetchProductPage(
+                    url,
+                    attempt + 1
+                );
+            }
+
+            throw error;
+        }
+    };
+
+    // ---------------------------------------------------------
+    // PARSE bajaj Electronics PRODUCT HTML
+    // ---------------------------------------------------------
+    
+
+    const parsebajajElectronicsProduct = (html, productUrl = '') => {
+
+        const $ = cheerio.load(html);
+
+        let name = '';
+        let price = '';
+        let availability = '';
+        let image = '';
+        let review = 0;
+        let rating = 0;
+
+        try {
+
+            // =====================================================
+            // CHECK PRODUCT PAGE
+            // =====================================================
+
+            if ($('div.productDetails').length) {
+
+                // =================================================
+                // PRODUCT NAME
+                // =================================================
+
+                name =
+                    $('div#ProductReightContent h4').first().text().trim() ||
+                    $('h4').first().text().trim();
+
+
+                // =================================================
+                // PRODUCT PRICE
+                // PHP:
+                // div[id="ProductReightContent"]
+                // div[class="priceDetails"] h3
+                // =================================================
+
+                let productPrice =
+                    $('#ProductReightContent .priceDetails h3')
+                        .first()
+                        .text()
+                        .trim();
+
+                if (productPrice) {
+
+                    productPrice = productPrice
+                        .replace(/₹/g, '')
+                        .replace(/,/g, '')
+                        .replace(/[^0-9.]/g, '')
+                        .trim();
+
+                    const numericPrice = parseFloat(productPrice);
+
+                    if (!isNaN(numericPrice) && numericPrice > 0) {
+                        price = numericPrice;
+                    }
+                }
+
+
+                // =================================================
+                // PRODUCT IMAGE
+                // PHP:
+                // div[id="MultipleImages"] img
+                // =================================================
+
+                image =
+                    $('#MultipleImages img')
+                        .first()
+                        .attr('src') || '';
+
+
+                // =================================================
+                // STOCK
+                // =================================================
+
+                const stockStatus = $('label.outOfStockLabel');
+                if (price > 0 && stockStatus.length === 0) {
+                    availability = 'In stock';
+                } else {
+                    price = '';
+                    availability = 'Out of stock';
+                }
+            }
+
+        } catch (error) {
+
+            console.log(
+                'Bajaj Electronics parser error:',
+                error.message
+            );
+        }
+
+        return {
+            name,
+            price,
+            availability,
+            image,
+            review,
+            rating
+        };
+    };
+
+    // ---------------------------------------------------------
+    // MAIN
+    // ---------------------------------------------------------
 
     try {
 
-        browser = await puppeteer.launch({
-            headless: true,
-            args: [
-                '--no-sandbox',
-                '--disable-setuid-sandbox',
-              //  '--proxy-server=http://31.59.20.176:6754'
-            ]
-        });
-
-        const page = await browser.newPage();
-        /*
-        await page.authenticate({
-            username: 'eqenhyym',
-            password: 'qsfp3x1obv71'
-        });
-        */
-        await page.setUserAgent(
-            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36'
-        );
-        /*
-        await page.goto(productUrl, {
-            waitUntil: 'networkidle2',
-            timeout: 30000
-        });
-        */
-        
         const cmpid = req.query.cmpid;
 
         if (!cmpid) {
-            return res.status(400).json({
-                status: false,
+
+            sendSSE('error', {
                 message: 'cmpid is required'
             });
+
+            return res.end();
         }
 
-        const companyId = cmpid.replace('plm_user_info_', '');
+        const companyId =
+            cmpid.replace('plm_user_info_', '');
+
         const ean = req.query.ean;
-        const itemcode = req.query.itemcode; 
+        const itemcode = req.query.itemcode;
+
+        const isSingleProduct =
+            !!(ean && itemcode);
+
+        // -----------------------------------------------------
+        // START
+        // -----------------------------------------------------
+
+        sendSSE('start', {
+            status: true,
+            message: 'bajaj Electronics scraping started',
+            cmpid,
+            companyId,
+            isSingleProduct
+        });
+
+        // -----------------------------------------------------
+        // FILTER
+        // -----------------------------------------------------
 
         const filter = {
+
             status: 'active',
-            product_scrape_status: { $in: ['pending', 'completed'] },
-            product_url: { $nin: ['', null, 'No Result'] }
+
+            product_scrape_status: {
+                $in: [
+                    'pending',
+                    'completed'
+                ]
+            },
+
+            product_url: {
+                $nin: [
+                    '',
+                    null,
+                    'No Result'
+                ]
+            }
         };
 
-        const isSingleProduct = !!(ean && itemcode);
+        // -----------------------------------------------------
+        // SINGLE PRODUCT
+        // -----------------------------------------------------
 
-        if(isSingleProduct){
-            filter[`${companyId}_product_id`] = ean;
-            filter[`${companyId}_product_code`] = itemcode;
-        }    
+        if (isSingleProduct) {
+
+            filter[
+                `${companyId}_product_id`
+            ] = ean;
+
+            filter[
+                `${companyId}_product_code`
+            ] = itemcode;
+        }
+
+        // -----------------------------------------------------
+        // FETCH PRODUCTS
+        // -----------------------------------------------------
+
+        sendSSE('step', {
+            step: 'products',
+            status: 'running',
+            message: 'Fetching products from database...'
+        });
 
         const products = await executeMongoFind(
             {
-                collection: 'ept_product_details_new_bajaj_electronics',
+                collection:
+                    'ept_product_details_new_bajaj_electronics',
                 cmpid
             },
             filter,
-            { _id: 0 }
+            {
+                _id: 0
+            }
         );
 
-        if(products.length > 0){
-            const existingProducts = await executeMongoFind(
+        // -----------------------------------------------------
+        // NO PRODUCTS
+        // -----------------------------------------------------
+
+        if (!products || products.length === 0) {
+
+            sendSSE('complete', {
+                status: true,
+                message: 'Products Not Found',
+                totalProcessed: 0,
+                data: []
+            });
+
+            return res.end();
+        }
+
+        sendSSE('products_found', {
+            message:
+                `Found ${products.length} products in source collection`,
+            count: products.length
+        });
+
+        // -----------------------------------------------------
+        // FETCH EXISTING PRODUCTS
+        // -----------------------------------------------------
+
+        sendSSE('step', {
+            step: 'matching',
+            status: 'running',
+            message: 'Matching products with main product collection...'
+        });
+
+        const existingProducts =
+            await executeMongoFind(
                 {
-                    collection: 'ept_product_details_new',
+                    collection:
+                        'ept_product_details_new',
                     cmpid
                 },
                 {
                     $and: [
-                        { status: 'active' },
-                        {ean_product_data_details_scrap_status : 'completed'}
+                        {
+                            status: 'active'
+                        },
+                        {
+                            ean_product_data_details_scrap_status:
+                                'completed'
+                        }
                     ]
                 },
-                { _id: 0, product_ean_id: 1, product_code: 1 }
+                {
+                    _id: 0,
+                    product_ean_id: 1,
+                    product_code: 1
+                }
             );
 
-            const productMap = new Set();
+        // -----------------------------------------------------
+        // CREATE PRODUCT MAP
+        // -----------------------------------------------------
+  
 
-            existingProducts.forEach((row) => {
-                const key = `${row.product_ean_id}_${row.product_code}`;
+        const productMap = new Set();
+
+        if (Array.isArray(existingProducts)) {
+
+            existingProducts.forEach(row => {
+
+                const key =
+                    `${row.product_ean_id}_${row.product_code}`;
+
                 productMap.add(key);
             });
+        }
 
-            // Filter matching products
-            const ArrGetProductInfo = [];
+        // -----------------------------------------------------
+        // FILTER PRODUCTS
+        // -----------------------------------------------------
 
-            products.forEach((arrTmp) => {
-                const key = `${arrTmp[`${companyId}_product_id`]}_${arrTmp[`${companyId}_product_code`]}`;
+        const ArrGetProductInfo = [];
 
-                if (productMap.has(key) && arrTmp['product_url'].includes('https://www.bajajelectronics.com')) {
-                    ArrGetProductInfo.push(arrTmp);
-                }
+        products.forEach(product => {
+
+            const productId =
+                product[
+                    `${companyId}_product_id`
+                ];
+
+            const productCode =
+                product[
+                    `${companyId}_product_code`
+                ];
+
+            const productUrl =
+                product.product_url;
+
+            if (!productUrl) {
+                return;
+            }
+
+            const key =
+                `${productId}_${productCode}`;
+
+            // Only matching main products
+            if (!productMap.has(key)) {
+                return;
+            }
+
+            // Only Relinace Digital URLs
+            if (
+                !productUrl
+                    .toLowerCase()
+                    .startsWith('https://www.bajajelectronics.com/')
+            ) {
+                return;
+            }
+
+            ArrGetProductInfo.push(product);
+        });
+
+
+        // -----------------------------------------------------
+        // NO MATCHING PRODUCTS
+        // -----------------------------------------------------
+
+        if (ArrGetProductInfo.length === 0) {
+
+            sendSSE('complete', {
+                status: true,
+                message: 'Active Products Not Found',
+                totalProcessed: 0,
+                data: []
             });
 
-            if(ArrGetProductInfo.length > 0){
-                const ScrapingProductCount = ArrGetProductInfo.length;
-                const startTime = new Date(`${getCurrentIndTimeInfo('India_Railway_Date_Only')}T${getCurrentIndTimeInfo('India_Railway_Time')}`);
-                const cronStarttime = getCurrentIndTimeInfo();
+            return res.end();
+        }
 
-                if (!isSingleProduct) {
-                    await updateStartTimeInDb(cmpid, companyId, cronName, ScrapingProductCount);
+        sendSSE('filtered_products', {
+            message:
+                `Found ${ArrGetProductInfo.length} products to scrape`,
+            count:
+                ArrGetProductInfo.length
+        });
+
+        // -----------------------------------------------------
+        // SCRAPING COUNT
+        // -----------------------------------------------------
+
+        const ScrapingProductCount =
+            ArrGetProductInfo.length;
+
+        const startTime =
+            new Date(
+                `${getCurrentIndTimeInfo(
+                    'India_Railway_Date_Only'
+                )}T${getCurrentIndTimeInfo(
+                    'India_Railway_Time'
+                )}`
+            );
+
+        const cronStarttime =
+            getCurrentIndTimeInfo();
+
+        // -----------------------------------------------------
+        // CRON START
+        // -----------------------------------------------------
+
+        if (!isSingleProduct) {
+
+            await updateStartTimeInDb(
+                cmpid,
+                companyId,
+                cronName,
+                ScrapingProductCount
+            );
+        }
+
+        let productCount = 0;
+
+        const scrapedData = [];
+
+        // -----------------------------------------------------
+        // PRODUCT LOOP
+        // -----------------------------------------------------
+
+        for (
+            const product
+            of ArrGetProductInfo
+        ) {
+
+            const productId =
+                product[
+                    `${companyId}_product_id`
+                ];
+
+            const productCode =
+                product[
+                    `${companyId}_product_code`
+                ];
+
+            const productUrl =
+                product.product_url;
+
+            // -------------------------------------------------
+            // PROGRESS
+            // -------------------------------------------------
+
+            sendSSE('progress', {
+
+                current:
+                    productCount + 1,
+
+                total:
+                    ScrapingProductCount,
+
+                product_id:
+                    productId,
+
+                product_code:
+                    productCode,
+
+                url:
+                    productUrl,
+
+                percentage:
+                    Math.round(
+                        (
+                            (productCount + 1) /
+                            ScrapingProductCount
+                        ) * 100
+                    )
+            });
+
+            // -------------------------------------------------
+            // URL VALIDATION
+            // -------------------------------------------------
+
+            let hostname;
+
+            try {
+
+                hostname =
+                    new URL(productUrl)
+                        .hostname
+                        .toLowerCase();
+
+            } catch (error) {
+
+                sendSSE('product_error', {
+
+                    product_id:
+                        productId,
+
+                    product_code:
+                        productCode,
+
+                    error:
+                        'Invalid product URL'
+                });
+
+                continue;
+            }
+
+            if (!hostname.includes('bajajelectronics.com')) {
+
+                sendSSE('warning', {
+
+                    message:
+                        'Only bajaj Electronics URLs supported',
+
+                    url:
+                        productUrl
+                });
+
+                continue;
+            }
+
+            // -------------------------------------------------
+            // DEFAULT VALUES
+            // -------------------------------------------------
+
+            let varProductPrice =
+                'No Result';
+
+            let varProductStock =
+                'No Result';
+
+            let varProductImage =
+                'No Result';
+
+            let varProductReview =
+                'No Result';
+
+            let varProductRating =
+                'No Result';
+
+            let scrapeStatus =
+                'pending';
+
+            // -------------------------------------------------
+            // SCRAPE
+            // -------------------------------------------------
+
+            try {
+
+                sendSSE('product_start', {
+
+                    product_id:
+                        productId,
+
+                    product_code:
+                        productCode,
+
+                    url:
+                        productUrl,
+
+                    status:
+                        'scraping'
+                });
+
+                // -------------------------------------------------
+                // HTTP REQUEST
+                // -------------------------------------------------
+
+                const html =
+                    await fetchProductPage(
+                        productUrl
+                    );
+            
+
+                // -------------------------------------------------
+                // PARSE HTML
+                // -------------------------------------------------
+
+                const result =
+                    parsebajajElectronicsProduct(html);
+
+                // -------------------------------------------------
+                // PRODUCT NOT FOUND
+                // -------------------------------------------------
+
+                if (result === null) {
+
+                    varProductPrice =
+                        'No Result';
+
+                    varProductStock =
+                        'No Result';
+
+                    varProductImage =
+                        'No Result';
+
+                    varProductReview =
+                        'No Result';
+
+                    varProductRating =
+                        'No Result';
+
+                    scrapeStatus =
+                        'pending';
+
+                    sendSSE('product_failed', {
+
+                        product_id:
+                            productId,
+
+                        product_code:
+                            productCode,
+
+                        reason:
+                            'Product JSON/schema not found'
+                    });
+
+                } else {
+
+                    // -------------------------------------------------
+                    // AVAILABILITY
+                    // -------------------------------------------------
+
+                    const status =
+                        (
+                            result.availability ||
+                            ''
+                        )
+                            .toLowerCase()
+                            .trim();
+
+                    // -------------------------------------------------
+                    // IMAGE
+                    // -------------------------------------------------
+
+                    varProductImage =
+                        result.image ||
+                        'No Result';
+
+                    // -------------------------------------------------
+                    // REVIEW
+                    // -------------------------------------------------
+
+                    varProductReview =
+                        parseFloat(
+                            result.review
+                        ) || 0;
+
+                    // -------------------------------------------------
+                    // RATING
+                    // -------------------------------------------------
+
+                    varProductRating =
+                        parseFloat(
+                            result.rating
+                        ) || 0;
+
+                    // -------------------------------------------------
+                    // PRICE
+                    // -------------------------------------------------
+
+                    const cleanedPrice =
+                        result.price || '';
+
+                    const numericPrice =
+                        parseFloat(
+                            String(cleanedPrice)
+                                .replace(/[^0-9.]/g, '')
+                        ) || 0;
+
+                    // -------------------------------------------------
+                    // STOCK
+                    // -------------------------------------------------
+
+                    if (
+                        (
+                            status.includes('instock') ||
+                            status.includes('in stock')
+                        ) &&
+                        numericPrice > 0
+                    ) {
+
+                        varProductPrice =
+                            numericPrice;
+
+                        varProductStock =
+                            'In stock';
+
+                    } else if (
+                        status.includes('outofstock') ||
+                        status.includes('out of stock') ||
+                        status.includes('currently unavailable')
+                    ) {
+
+                        varProductStock =
+                            'Out Of Stock';
+
+                        // Keep price as No Result
+                        // for unavailable products.
+
+                    } else {
+
+                        // Unknown availability.
+                        // If price exists, keep it,
+                        // otherwise No Result.
+
+                        if (numericPrice > 0) {
+
+                            varProductPrice =
+                                numericPrice;
+                        }
+
+                        if (status) {
+
+                            varProductStock =
+                                status;
+                        }
+                    }
+
+                    scrapeStatus =
+                        'completed';
                 }
-                
-                let productCount = 0;
 
-                const scrapedData = [];
-                
-                for (const product of ArrGetProductInfo) {
-                    // console.log(product.product_url); return false;
-                    const productUrl = product.product_url;
-                    //const productUrl = "https://www.bajajelectronics.com/sony-sound-bar-ht-s20";
-                    const hostname = new URL(productUrl).hostname;
-                    // console.log(productUrl);
+                // -------------------------------------------------
+                // MODIFIED DATE
+                // -------------------------------------------------
 
-                    // bajaj_electronics
-                    if (hostname.includes('bajajelectronics')) {
-                        try {
-                            await page.goto(productUrl, {
-                                waitUntil: 'networkidle2',
-                                timeout: 50000
-                            });
+                const modifiedDate =
+                    getCurrentIndTimeInfo(
+                        'India_Railway_Date_Time'
+                    );
 
-                            let varProductPrice;
-                            let varProductStock;
-                            let varProductImage;
-                            let scrapeStatus;
-                            let modifiedDate;
+                // -------------------------------------------------
+                // PRICE CHANGE
+                // -------------------------------------------------
 
-                            if(await page.$('div.productDetails') === null) {
-                                //console.log('No product title found');
-                                varProductPrice = 'No Result';
-                                varProductStock = 'No Result';
-                                varProductImage = 'No Result';
-                                scrapeStatus = 'pending';
-                            }
-                            else{
-                                const result = await page.evaluate(() => {
-                                    const ProductCompPrice = document.querySelector('div.priceDetails h3').textContent;
+                await updatePriceChangeData(
 
-                                    const StockStatus = document.querySelector('.launchLabel.outOfStockLabel') ? 'outofstock' : 'instock';
+                    scrapeStatus,
 
-                                    const ProductImg = document.querySelector('.img250p5')?.getAttribute('src');
+                    product.product_price,
 
-                                    return {
-                                        price: ProductCompPrice || '',
-                                        availability: StockStatus || '',
-                                        image: ProductImg || ''
-                                    };
-                                });
+                    varProductPrice,
 
-                                // console.log(result);
-                                //console.log(product[`${companyId}_product_id`]);
-                                
-                                varProductPrice = 'No Result';
-                                varProductStock = 'No Result';
-                                varProductImage = 'No Result';
-                                scrapeStatus = 'pending';
+                    productId,
 
-                                if (result !== null) {
-                                    const status = (result.availability || '').toLowerCase().trim();
+                    productCode,
 
-                                    varProductImage = result.image || 'No Result';
-                                    const cleanedPrice = (result.price || '').replace(/[^0-9.]/g, '');
+                    cronName,
 
-                                    if ((status.includes('instock')) && (cleanedPrice > 0)) {
-                                        varProductPrice = parseFloat(cleanedPrice);
-                                        varProductStock = 'In stock';
-                                    }
-                                    else if(status.includes('outofstock') || status.includes('currently unavailable')){
-                                        varProductStock = 'Out Of Stock';
-                                    }
-                                    scrapeStatus = 'completed';
-                                } 
-                            }
+                    cmpid,
 
-                            modifiedDate = getCurrentIndTimeInfo('India_Railway_Date_Time');
+                    companyId
+                );
 
-                            updatePriceChangeData(scrapeStatus,product.product_price,varProductPrice,product[`${companyId}_product_id`],product[`${companyId}_product_code`],cronName,cmpid,companyId,);
+                // -------------------------------------------------
+                // UPDATE MONGO
+                // -------------------------------------------------
 
-                            await executeMongoUpdate(
-                                {
-                                    collection: 'ept_product_details_new_bajaj_electronics',
-                                    cmpid
-                                },
-                                {
-                                    [`${companyId}_product_id`]:
-                                        product[`${companyId}_product_id`],
+                await executeMongoUpdate(
 
-                                    [`${companyId}_product_code`]:
-                                        product[`${companyId}_product_code`]
-                                },
-                                {
-                                    $set: {
-                                        product_price: varProductPrice,
-                                        product_stock: varProductStock,
-                                        product_image: varProductImage,
-                                        modified_date: modifiedDate,
-                                        product_scrape_status: scrapeStatus,
-                                        product_review: 'No Result',
-                                        product_rating: 'No Result'
-                                    }
-                                }
-                            );
+                    {
+                        collection:
+                            'ept_product_details_new_bajaj_electronics',
+                        cmpid
+                    },
 
-                            scrapedData.push({
-                                product_ean_id: product[`${companyId}_product_id`],
-                                product_code: product[`${companyId}_product_code`],
-                                product_price: varProductPrice,
-                                product_stock: varProductStock,
-                                modified_date: modifiedDate
-                            });
+                    {
+                        [`${companyId}_product_id`]:
+                            productId,
 
-                            productCount++;
-                            
-                            if (!isSingleProduct) {
-                                await updateEndTimeInDb(productCount, 'running', cmpid, companyId, null, cronName, cronStarttime, ScrapingProductCount);
-                            }
-                            
-                            console.log(product[`${companyId}_product_id`]);
-                            // if(productCount === 20){
-                            // return res.status(200).json({
-                            //     status: true,
-                            //     data: product[`${companyId}_product_id`]
-                            // });
-                            // }
-                        }
-                        catch (error) {
-                            console.error(`Error scraping product ${product[`${companyId}_product_id`]}`);
-                            console.error(error);
+                        [`${companyId}_product_code`]:
+                            productCode
+                    },
+
+                    {
+                        $set: {
+
+                            product_price:
+                                varProductPrice,
+
+                            product_stock:
+                                varProductStock,
+
+                            product_image:
+                                varProductImage,
+
+                            modified_date:
+                                modifiedDate,
+
+                            product_scrape_status:
+                                scrapeStatus,
+
+                            product_review:
+                                varProductReview,
+
+                            product_rating:
+                                varProductRating
                         }
                     }
+                ); 
 
-                    else {
-                        console.log(`${companyId}_product_id`);
-                        console.log(productUrl);
-                        return res.status(400).json({
-                            status: false,
-                            message: 'Only sonoviion and co URLs supported'
-                        });
+                // -------------------------------------------------
+                // RESULT
+                // -------------------------------------------------
 
-                    }
-                    //break;
-                    //res.json(result); 
-                    //console.log(product[`${companyId}_product_id`]);
-                    //return(product[`${companyId}_product_id`]);
+                const scrapedItem = {
+
+                    product_ean_id:
+                        productId,
+
+                    product_code:
+                        productCode,
+
+                    product_price:
+                        varProductPrice,
+
+                    product_stock:
+                        varProductStock,
+                    
+                    product_review:
+                        varProductReview,
+                    
+                    product_rating:
+                        varProductRating,
+
+                    modified_date:
+                        modifiedDate
                 };
 
-                const endTime = new Date(`${getCurrentIndTimeInfo('India_Railway_Date_Only')}T${getCurrentIndTimeInfo('India_Railway_Time')}`);
+                scrapedData.push(
+                    scrapedItem
+                );
 
-                const diffMs = endTime - startTime;
-                const totalMins = +(diffMs / 60000).toFixed(2);
+                productCount++;
+
+                // -------------------------------------------------
+                // PRODUCT SCRAPED EVENT
+                // -------------------------------------------------
+
+                sendSSE(
+                    'product_scraped',
+                    {
+
+                        ...scrapedItem,
+
+                        scrape_status:
+                            scrapeStatus,
+
+                        progress: {
+
+                            current:
+                                productCount,
+
+                            total:
+                                ScrapingProductCount,
+
+                            percentage:
+                                Math.round(
+                                    (
+                                        productCount /
+                                        ScrapingProductCount
+                                    ) * 100
+                                )
+                        }
+                    }
+                );
+
+                // -------------------------------------------------
+                // CRON UPDATE
+                // -------------------------------------------------
 
                 if (!isSingleProduct) {
-                    await updateEndTimeInDb(productCount, 'ending', cmpid, companyId, totalMins, cronName, cronStarttime, ScrapingProductCount);
+
+                    await updateEndTimeInDb(
+
+                        productCount,
+
+                        'running',
+
+                        cmpid,
+
+                        companyId,
+
+                        null,
+
+                        cronName,
+
+                        cronStarttime,
+
+                        ScrapingProductCount
+                    );
                 }
 
-                return res.status(200).json({
-                    status: true,
-                    message: "Scraping completed",
-                    totalProcessed: productCount,
-                    data : scrapedData
-                });
+            } catch (error) {
+
+                console.error(
+                    `Error scraping bajaj Electronics product ${productId}:`,
+                    error.message
+                );
+
+                // ---------------------------------------------
+                // PRODUCT ERROR
+                // ---------------------------------------------
+
+                sendSSE(
+                    'product_error',
+                    {
+
+                        product_id:
+                            productId,
+
+                        product_code:
+                            productCode,
+
+                        error:
+                            error.message
+                    }
+                );
+
+                // ---------------------------------------------
+                // Do NOT stop entire scraper.
+                // Continue next product.
+                // ---------------------------------------------
+
+                continue;
             }
-            else{
-                return res.status(200).json({
-                    status: true,
-                    message: "Active Products Not Found"
-                });
-            }
-        }else{
-            return res.status(200).json({
-                status: true,
-                message: "Products Not Found"
-            });
         }
 
-    } 
-    catch(error){
-        res.status(500).json({
-            status: false,
-            message: error.message
+        // ---------------------------------------------------------
+        // END TIME
+        // ---------------------------------------------------------
+
+        const endTime =
+            new Date(
+                `${getCurrentIndTimeInfo(
+                    'India_Railway_Date_Only'
+                )}T${getCurrentIndTimeInfo(
+                    'India_Railway_Time'
+                )}`
+            );
+
+        const diffMs =
+            endTime - startTime;
+
+        const totalMins =
+            +(
+                diffMs / 60000
+            ).toFixed(2);
+
+        // ---------------------------------------------------------
+        // CRON END
+        // ---------------------------------------------------------
+
+        if (!isSingleProduct) {
+
+            await updateEndTimeInDb(
+
+                productCount,
+
+                'ending',
+
+                cmpid,
+
+                companyId,
+
+                totalMins,
+
+                cronName,
+
+                cronStarttime,
+
+                ScrapingProductCount
+            );
+        }
+
+        // ---------------------------------------------------------
+        // COMPLETE
+        // ---------------------------------------------------------
+
+        sendSSE('complete', {
+
+            status: true,
+
+            message:
+                'bajaj Electronics scraping completed',
+
+            totalProcessed:
+                productCount,
+
+            totalProducts:
+                ScrapingProductCount,
+
+            totalMins,
+
+            data:
+                scrapedData
         });
-    } 
-    finally{
-        if (browser) {
-            console.log('Closing browser...');
-            await browser.close();
-        }
-    }
-};
 
-module.exports = { bajaj_electronicsScraper };
+        return res.end();
+
+    } catch (error) {
+
+        console.error(
+            'bajaj Electronics scraper fatal error:',
+            error
+        );
+
+        sendSSE('error', {
+
+            status: false,
+
+            message:
+                error.message,
+
+            stack:
+                process.env.NODE_ENV === 'development'
+                    ? error.stack
+                    : undefined
+        });
+
+        return res.end();
+    }
+}
+
+module.exports = {
+    bajaj_electronicsScraper
+};
