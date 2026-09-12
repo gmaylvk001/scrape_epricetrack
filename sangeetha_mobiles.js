@@ -85,8 +85,8 @@ async function fetchSangeethaProductData(productUrl, pincode, sendSSE) {
         return null;
     }
 
-    const apiUrl = 'https://www.sangeethamobiles.com/b/customer/api/v3/product-details';
-    const stockUrl = 'https://www.sangeethamobiles.com/b/customer/api/v3/product-eta-details';
+    const apiUrl = 'https://www.sangeetha.com/b/customer/api/v3/product-details';
+    const stockUrl = 'https://www.sangeetha.com/b/customer/api/v3/product-eta-details';
 
     const payload = {
         type: 'desktop',
@@ -100,7 +100,7 @@ async function fetchSangeethaProductData(productUrl, pincode, sendSSE) {
         'Accept': 'application/json, text/plain, */*',
         'Content-Type': 'application/json',
         'Accept-Language': 'en-US,en;q=0.9,ta;q=0.8',
-        'Origin': 'https://www.sangeethamobiles.com',
+        'Origin': 'https://www.sangeetha.com',
         'Referer': productUrl
     };
 
@@ -192,7 +192,7 @@ async function processProduct(product, companyId, pincode, sendSSE, scrapedData,
         return productCount; // unchanged
     }
 
-    if (!hostname.includes('www.sangeethamobiles.com')) {
+    if (!hostname.includes('www.sangeetha.com')) {
         sendSSE('warning', {
             message: 'Only sangeethamobiles URLs supported',
             url: productUrl
@@ -474,7 +474,7 @@ async function sangeethamobilesScraper(req, res) {
             const key = `${productId}_${productCode}`;
             if (!productMap.has(key)) return;
 
-            if (!productUrl.toLowerCase().startsWith('https://www.sangeethamobiles.com/product-details/')) return;
+            if (!productUrl.toLowerCase().startsWith('https://www.sangeetha.com/product-details/')) return;
 
             productsToScrape.push(product);
         });
