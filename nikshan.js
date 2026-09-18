@@ -83,7 +83,6 @@ async function nikshanScraper(req, res) {
                 
                 timeout: 30000,
                 maxRedirects: 5,
-                proxy: proxyConfig,
 
                 // Do not throw for normal HTTP responses.
                 validateStatus: (status) => {

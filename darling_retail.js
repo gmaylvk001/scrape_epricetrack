@@ -81,7 +81,6 @@ async function darlingretail_Scraper(req, res) {
             const response = await axios.get(url, {
                 timeout: 30000,
                 maxRedirects: 5,
-                proxy: proxyConfig,
 
                 // Do not throw for normal HTTP responses.
                 validateStatus: (status) => {
