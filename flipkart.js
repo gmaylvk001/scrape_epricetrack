@@ -261,6 +261,8 @@ async function flipkartScraper(req, res) {
                 throw loadError || new Error('Page load failed after retries');
             }
 
+            await delay(1000);
+
             // ── Extract JSON‑LD ──────────────────────────────────
             const jsonLdExists = await page.$('#jsonLD');
             let varProductPrice = 'No Result';
