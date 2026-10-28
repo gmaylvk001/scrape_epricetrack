@@ -668,7 +668,7 @@ async function amazonScraper(req, res) {
                 });
 
                 // Check if product title exists
-                const productTitleExists = await page.waitForSelector('#productTitle', { 
+                const productTitleExists = await page.waitForSelector('#dp-container', { 
                     timeout: 5000 
                 }).catch(() => null);
 
@@ -680,7 +680,7 @@ async function amazonScraper(req, res) {
                         productCode,
                         step: 'product_title',
                         status: 'failed',
-                        message: 'Product title not found'
+                        message: 'Product Page not found'
                     });
                     failedScrapes++;
 
