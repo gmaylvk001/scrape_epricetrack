@@ -123,12 +123,12 @@ async function paiinternationalScraper(req, res) {
             // =====================================================
 
             const stockRequestUrl =
-                'https://www.paiinternational.in/api/v1/get_product_eta_pincode/';
+                'https://www.paiinternational.in/api/v1/get_state_product_stock/';
 
             const stockResponse = await axios.post(
                 stockRequestUrl,
                 {
-                    pincode: pincode,
+                    state_id: "2",
                     product_slug: productSlug
                 },
                 {
@@ -141,16 +141,11 @@ async function paiinternationalScraper(req, res) {
             );
 
             const stockData = stockResponse.data;
-
             // =====================================================
             // 4. CHECK STOCK
             // =====================================================
 
-            if (
-                stockData?.status !== true &&
-                stockData?.message ===
-                    'The product is currently unavailable for delivery'
-            ) {
+            if (stockData?.status !== true) {
                 price = '';
                 availability = 'Out Of Stock';
 
