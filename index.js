@@ -93,7 +93,13 @@ const {
     sangeethamobilesScraper
 } = require('./sangeetha_mobiles');
 
+const {
+    flipkartTittleScraper
+} = require('./flipkart_title');
 
+const {
+    oxygenDigitalShopScraper
+} = require('./oxygen');
 
 const app = express();
 
@@ -159,6 +165,11 @@ app.use('/flipkart', (req, res, next) => {
 ROUTES
 ============================================================
 */
+
+app.get(
+    '/flipkart_title',
+    flipkartTittleScraper
+);
 
 app.get(
     '/scrape',
@@ -270,7 +281,10 @@ app.get(
     sangeethamobilesScraper
 );
 
-
+app.get(
+    '/oxygen',
+    oxygenDigitalShopScraper
+);
 
 /*
 ============================================================
