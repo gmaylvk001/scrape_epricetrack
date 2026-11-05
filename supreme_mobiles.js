@@ -179,8 +179,8 @@ async function supremeMobilesScraper(req, res) {
             // 1. CHECK 404 / PRODUCT PAGE
             // ============================================
 
-            const is404 = $('div.m-page404').length > 0;
-            const isProductPage = $('div.m-main-product--wrapper').length > 0;
+            const is404 = $('body.404-template').length > 0;
+            const isProductPage = $('body.product-template').length > 0;
 
             if (is404 || !isProductPage) {
                 return {
@@ -199,7 +199,7 @@ async function supremeMobilesScraper(req, res) {
             // responsive-image img
             // ============================================
 
-            image = $('responsive-image img').first().attr('src') || '';
+            image = $('div.MagicToolboxSlide.active-magic-slide a figure img').first().attr('src') || '';
 
             if (image && image.startsWith('//')) {
                 image = `https:${image}`;
@@ -212,11 +212,11 @@ async function supremeMobilesScraper(req, res) {
             // span[class=m-add-to-cart--text]
             // ============================================
 
-            const stockText = $('span.m-add-to-cart--text')
+            const stockText = $('button.product-form__submit span')
                 .first()
                 .text()
                 .trim();
-
+            
             if (
                 stockText &&
                 !stockText.toLowerCase().includes('sold out')
@@ -225,7 +225,6 @@ async function supremeMobilesScraper(req, res) {
             } else {
                 availability = 'Out of stock';
             }
-
 
             // ============================================
             // 4. EXTRACT SHOPIFY "Viewed Product" JSON
@@ -236,7 +235,7 @@ async function supremeMobilesScraper(req, res) {
 
                 let productJson = html
                     .split('("Viewed Product",')[1];
-
+                
                 if (productJson) {
 
                     productJson = productJson
@@ -247,7 +246,7 @@ async function supremeMobilesScraper(req, res) {
                     try {
 
                         const productData = JSON.parse(productJson);
-
+                        
                         // ============================================
                         // 5. PRODUCT NAME
                         // ============================================
@@ -297,7 +296,7 @@ async function supremeMobilesScraper(req, res) {
             if (!name) {
 
                 name =
-                    $('h1.m-product-title')
+                    $('h1.product__title')
                         .first()
                         .text()
                         .trim() ||
@@ -316,11 +315,7 @@ async function supremeMobilesScraper(req, res) {
             if (!price) {
 
                 const priceText =
-                    $('.m-price-item--sale')
-                        .first()
-                        .text()
-                        .trim() ||
-                    $('.price')
+                    $('span.f-price-item.f-price-item--sale')
                         .first()
                         .text()
                         .trim();
